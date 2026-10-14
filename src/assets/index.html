@@ -1,0 +1,511 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>dev-sidecar-rs · 开发者边车</title>
+<style>
+  :root {
+    --bg: #0f1420; --panel: #171e2e; --panel2: #1d2740; --line: #2a3653;
+    --text: #dbe4f5; --muted: #8391ad; --accent: #4f8cff; --accent2: #37c99e;
+    --warn: #f5a623; --err: #f2637f; --radius: 10px;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 14px/1.6 -apple-system, "PingFang SC", "Microsoft YaHei", "Noto Sans CJK SC", sans-serif;
+  }
+  header {
+    display: flex; align-items: center; gap: 12px; padding: 14px 22px;
+    border-bottom: 1px solid var(--line); background: var(--panel);
+    position: sticky; top: 0; z-index: 10;
+  }
+  header h1 { font-size: 17px; margin: 0; font-weight: 600; }
+  header .ver { color: var(--muted); font-size: 12px; }
+  header .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--accent2); box-shadow: 0 0 8px var(--accent2); }
+  nav { display: flex; gap: 4px; margin-left: 18px; flex: 1; }
+  nav button {
+    background: none; border: none; color: var(--muted); font-size: 14px; padding: 8px 14px;
+    cursor: pointer; border-radius: 8px;
+  }
+  nav button.active { color: var(--text); background: var(--panel2); }
+  main { max-width: 1080px; margin: 22px auto; padding: 0 18px; }
+  section { display: none; }
+  section.active { display: block; }
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 14px; }
+  .card {
+    background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: 14px 16px;
+  }
+  .card .k { color: var(--muted); font-size: 12px; }
+  .card .v { font-size: 22px; font-weight: 600; margin-top: 2px; font-variant-numeric: tabular-nums; }
+  .card .v.small { font-size: 15px; word-break: break-all; }
+  .panel {
+    background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius);
+    padding: 16px 18px; margin-top: 16px;
+  }
+  .panel h2 { font-size: 15px; margin: 0 0 12px; }
+  .row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+  button.btn {
+    background: var(--accent); color: #fff; border: none; border-radius: 8px;
+    padding: 8px 16px; font-size: 13px; cursor: pointer;
+  }
+  button.btn:hover { filter: brightness(1.1); }
+  button.btn.ghost { background: var(--panel2); color: var(--text); border: 1px solid var(--line); }
+  button.btn.danger { background: transparent; color: var(--err); border: 1px solid var(--err); }
+  button.btn.mini { padding: 4px 10px; font-size: 12px; }
+  button.btn:disabled { opacity: .35; cursor: default; }
+  button.btn:disabled:hover { filter: none; }
+  input[type=text], input[type=number], select, textarea {
+    background: var(--panel2); color: var(--text); border: 1px solid var(--line);
+    border-radius: 8px; padding: 7px 10px; font-size: 13px; outline: none; width: 100%;
+    font-family: ui-monospace, "JetBrains Mono", Menlo, Consolas, monospace;
+  }
+  textarea { min-height: 64px; resize: vertical; }
+  input:focus, textarea:focus { border-color: var(--accent); }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th { text-align: left; color: var(--muted); font-weight: 500; padding: 6px 8px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+  td { padding: 8px; border-bottom: 1px solid var(--line); vertical-align: top; word-break: break-all; }
+  tr:last-child td { border-bottom: none; }
+  .tag { display: inline-block; padding: 1px 8px; border-radius: 20px; font-size: 11px; margin-right: 4px; }
+  .tag.on { background: rgba(55, 201, 158, .15); color: var(--accent2); }
+  .tag.off { background: rgba(131, 145, 173, .15); color: var(--muted); }
+  .tag.mitm { background: rgba(245, 166, 35, .15); color: var(--warn); }
+  .tag.re { background: rgba(79, 140, 255, .15); color: var(--accent); }
+  .muted { color: var(--muted); }
+  .switch { position: relative; width: 38px; height: 21px; flex: none; }
+  .switch input { display: none; }
+  .switch i {
+    position: absolute; inset: 0; background: var(--panel2); border: 1px solid var(--line);
+    border-radius: 20px; cursor: pointer; transition: .15s;
+  }
+  .switch i::after {
+    content: ""; position: absolute; width: 15px; height: 15px; border-radius: 50%;
+    background: var(--muted); top: 2px; left: 2px; transition: .15s;
+  }
+  .switch input:checked + i { background: rgba(55, 201, 158, .25); border-color: var(--accent2); }
+  .switch input:checked + i::after { background: var(--accent2); left: 19px; }
+  #logbox {
+    background: #0b0f18; border: 1px solid var(--line); border-radius: var(--radius);
+    padding: 12px 14px; height: 480px; overflow-y: auto;
+    font: 12px/1.7 ui-monospace, "JetBrains Mono", Menlo, Consolas, monospace;
+    white-space: pre-wrap; word-break: break-all;
+  }
+  .form-grid { display: grid; grid-template-columns: 110px 1fr; gap: 10px 12px; align-items: start; }
+  .form-grid label { color: var(--muted); font-size: 13px; padding-top: 8px; }
+  .hint { font-size: 12px; color: var(--muted); }
+  .toast {
+    position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%);
+    background: var(--panel2); border: 1px solid var(--line); color: var(--text);
+    padding: 10px 18px; border-radius: 10px; font-size: 13px; opacity: 0;
+    transition: .25s; pointer-events: none; box-shadow: 0 6px 24px rgba(0,0,0,.4);
+  }
+  .toast.show { opacity: 1; }
+  .toast.err { border-color: var(--err); }
+  ol.install li { margin-bottom: 6px; }
+  code { background: var(--panel2); padding: 1px 6px; border-radius: 5px; font-size: 12px; }
+  .kv { display: grid; grid-template-columns: 130px 1fr; gap: 4px 12px; font-size: 13px; }
+  .kv .k { color: var(--muted); }
+</style>
+</head>
+<body>
+<header>
+  <span class="dot" id="healthDot"></span>
+  <h1>dev-sidecar-rs</h1><span class="ver" id="verText"></span>
+  <nav>
+    <button data-tab="status" class="active">状态</button>
+    <button data-tab="rules">加速规则</button>
+    <button data-tab="logs">日志</button>
+    <button data-tab="cert">证书</button>
+    <button data-tab="settings">设置</button>
+  </nav>
+</header>
+
+<main>
+  <!-- 状态 -->
+  <section id="tab-status" class="active">
+    <div class="cards">
+      <div class="card"><div class="k">代理地址</div><div class="v small" id="stProxy">-</div></div>
+      <div class="card"><div class="k">请求总数</div><div class="v" id="stTotal">0</div></div>
+      <div class="card"><div class="k">隧道直连</div><div class="v" id="stTunnel">0</div></div>
+      <div class="card"><div class="k">MITM 解密</div><div class="v" id="stMitm">0</div></div>
+      <div class="card"><div class="k">镜像重定向</div><div class="v" id="stRewrite">0</div></div>
+      <div class="card"><div class="k">错误</div><div class="v" id="stErrors">0</div></div>
+    </div>
+    <div class="panel">
+      <h2>系统代理</h2>
+      <div class="row">
+        <button class="btn" onclick="sysProxy(true)">一键设置系统代理</button>
+        <button class="btn ghost" onclick="sysProxy(false)">取消系统代理</button>
+        <span class="hint">Linux 走 gsettings（GNOME）；macOS 走 networksetup；Windows 走注册表。退出程序时若由程序设置会自动恢复。</span>
+      </div>
+      <div class="row" style="margin-top:10px">
+        <span class="hint" id="sysProxyMsg"></span>
+      </div>
+    </div>
+    <div class="panel">
+      <h2>终端 / Git 使用</h2>
+      <div class="kv">
+        <span class="k">临时使用</span><code id="cmdProxy1">export https_proxy=http://127.0.0.1:3128 http_proxy=http://127.0.0.1:3128</code>
+        <span class="k">git 走代理</span><code id="cmdProxy2">git config --global http.https://github.com.proxy http://127.0.0.1:3128</code>
+        <span class="k">运行时间</span><span id="stUptime">-</span>
+        <span class="k">数据目录</span><span id="stDataDir">-</span>
+      </div>
+    </div>
+  </section>
+
+  <!-- 规则 -->
+  <section id="tab-rules">
+    <div class="panel">
+      <div class="row" style="justify-content:space-between; margin-bottom:8px">
+        <span class="hint">命中顺序从上到下，第一条命中的规则生效。无匹配 IP/DNS 时走系统解析。
+          “重定向”规则需要安装 CA 并启用 MITM 才能看见 HTTPS 路径。</span>
+        <span>
+          <button class="btn mini ghost" onclick="addRule()">+ 新增规则</button>
+          <button class="btn mini" onclick="saveRules()">保存全部</button>
+        </span>
+      </div>
+      <table>
+        <thead><tr>
+          <th style="width:44px">启用</th><th style="width:170px">名称</th><th>域名匹配</th>
+          <th>动作</th><th style="width:200px"></th>
+        </tr></thead>
+        <tbody id="rulesBody"></tbody>
+      </table>
+    </div>
+    <div class="panel" id="ipPoolPanel" style="display:none">
+      <h2>IP 优选结果</h2>
+      <div class="hint" style="margin-bottom:8px">按规则候选池自动测速（TCP+TLS，SNI=域名）选出的可用 IP（按延迟排序），5 分钟自动重测。</div>
+      <table>
+        <thead><tr><th style="width:220px">域名</th><th>优选 IP（按延迟排序）</th><th style="width:90px">可用/候选</th><th style="width:90px">测于</th></tr></thead>
+        <tbody id="ipPoolBody"></tbody>
+      </table>
+    </div>
+    <div class="panel" id="ruleEditor" style="display:none">
+      <h2 id="ruleEditorTitle">编辑规则</h2>
+      <div class="form-grid">
+        <label>名称</label><input type="text" id="fName">
+        <label>域名匹配</label><textarea id="fHosts" placeholder="每行一个：github.com 或 *.github.com"></textarea>
+        <label>路径匹配</label><textarea id="fPaths" placeholder="留空=该域名全部路径。/ 开头=前缀匹配，* 开头=包含匹配，如 *releases/download/"></textarea>
+        <label>IP 直连</label><textarea id="fIps" placeholder="可选，每行一个 IP，命中后直连（SNI 仍是原域名）"></textarea>
+        <label>候选 IP 池</label><textarea id="fPool" placeholder="可选，每行一个 IP；自动测速（TCP+TLS）选最快的可用 IP 直连，全部失败时走 DNS 竞速"></textarea>
+        <label>DNS 竞速</label><textarea id="fDns" placeholder="可选，每行一个 DNS 服务器，如 223.5.5.5"></textarea>
+        <label>重定向到</label><input type="text" id="fRewrite" placeholder="如 https://ghfast.top 或 https://registry.npmmirror.com">
+        <label>动作选项</label><span class="row">
+          <label class="switch"><input type="checkbox" id="fFullUrl"><i></i></label><span class="hint">fullUrl：重定向拼接完整原始 URL（ghfast.top 这类镜像用）</span>
+        </span>
+        <span></span><span class="row">
+          <label class="switch"><input type="checkbox" id="fMitm"><i></i></label><span class="hint">MITM：解密 HTTPS（需要安装 CA）</span>
+        </span>
+      </div>
+      <div class="row" style="margin-top:12px">
+        <button class="btn mini" onclick="applyRuleEdit()">确定</button>
+        <button class="btn mini ghost" onclick="closeRuleEditor()">取消</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- 日志 -->
+  <section id="tab-logs">
+    <div class="panel">
+      <div class="row" style="justify-content:space-between; margin-bottom:8px">
+        <span class="hint">实时日志（每秒轮询，最多保留 1000 条）</span>
+        <span class="row">
+          <label class="switch"><input type="checkbox" id="logFollow" checked><i></i></label><span class="hint">自动滚动</span>
+          <button class="btn mini ghost" onclick="logLines=0;$('#logbox').textContent=''">清屏</button>
+        </span>
+      </div>
+      <div id="logbox"></div>
+    </div>
+  </section>
+
+  <!-- 证书 -->
+  <section id="tab-cert">
+    <div class="panel">
+      <h2>根证书（仅“镜像重定向 / MITM”规则需要）</h2>
+      <div class="kv" style="margin-bottom:12px">
+        <span class="k">SHA-256</span><span style="font-size:12px" id="certFp">-</span>
+      </div>
+      <div class="row"><button class="btn" onclick="location.href='/ca.crt'">下载证书 ca.crt</button></div>
+    </div>
+    <div class="panel">
+      <h2>安装方法</h2>
+      <ol class="install hint">
+        <li><b>Linux (Fedora/RHEL)</b>：
+          <code>sudo cp ca.crt /etc/pki/ca-trust/source/anchors/dev-sidecar-rs-ca.crt && sudo update-ca-trust</code></li>
+        <li><b>Linux (Debian/Ubuntu)</b>：
+          <code>sudo cp ca.crt /usr/local/share/ca-certificates/dev-sidecar-rs-ca.crt && sudo update-ca-certificates</code></li>
+        <li><b>Windows</b>：双击 ca.crt → 安装证书 → 本地计算机 → “将所有的证书都放入下列存储” → 受信任的根证书颁发机构。</li>
+        <li><b>macOS</b>：双击 ca.crt 导入“系统”钥匙串，然后设置为“始终信任”。</li>
+        <li><b>Firefox</b>：设置 → 隐私与安全 → 证书 → 查看证书 → 导入 ca.crt（Firefox 用自己的证书库）。</li>
+        <li><b>Node.js</b>：<code>export NODE_EXTRA_CA_CERTS=/path/to/ca.crt</code></li>
+      </ol>
+    </div>
+  </section>
+
+  <!-- 设置 -->
+  <section id="tab-settings">
+    <div class="panel">
+      <h2>基本设置</h2>
+      <div class="form-grid" style="grid-template-columns: 170px 1fr">
+        <label>代理端口</label><input type="number" id="sProxyPort">
+        <label>管理界面端口</label><input type="number" id="sAdminPort">
+        <label>监听地址</label><input type="text" id="sListenHost">
+        <label></label><span class="row"><label class="switch"><input type="checkbox" id="sOpenBrowser"><i></i></label><span class="hint">启动后自动打开管理页面</span></span>
+        <label></label><span class="row"><label class="switch"><input type="checkbox" id="sAutoSysProxy"><i></i></label><span class="hint">启动时自动设置系统代理，退出时恢复</span></span>
+        <label></label><span class="row"><label class="switch"><input type="checkbox" id="sMitmAll"><i></i></label><span class="hint">对所有 HTTPS 做 MITM（默认只对勾选 MITM 的规则解密；需要 CA）</span></span>
+        <label></label><span class="row"><label class="switch"><input type="checkbox" id="sInsecure"><i></i></label><span class="hint" style="color:var(--err)">忽略上游 TLS 证书校验（仅调试用）</span></span>
+        <label>默认 DNS 列表</label><textarea id="sDns" placeholder="新规则的默认 DNS 竞速列表"></textarea>
+      </div>
+      <div class="row" style="margin-top:12px">
+        <button class="btn" onclick="saveSettings()">保存</button>
+        <span class="hint" id="settingsMsg"></span>
+      </div>
+    </div>
+  </section>
+</main>
+
+<div class="toast" id="toast"></div>
+
+<script>
+const $ = s => document.querySelector(s);
+let rules = [];
+let editingIdx = -1;
+let logLines = 0, logSeq = 0;
+
+function toast(msg, err) {
+  const t = $('#toast');
+  t.textContent = msg;
+  t.className = 'toast show' + (err ? ' err' : '');
+  setTimeout(() => t.classList.remove('show'), 2600);
+}
+async function api(path, opts) {
+  const r = await fetch(path, opts);
+  if (!r.ok) throw new Error((await r.text()).slice(0, 300));
+  return r.json();
+}
+const fmtList = arr => (arr || []).join('\n');
+const toList = s => s.split('\n').map(x => x.trim()).filter(Boolean);
+
+// ---------- tabs ----------
+document.querySelectorAll('nav button').forEach(b => b.onclick = () => {
+  document.querySelectorAll('nav button').forEach(x => x.classList.remove('active'));
+  document.querySelectorAll('section').forEach(x => x.classList.remove('active'));
+  b.classList.add('active');
+  $('#tab-' + b.dataset.tab).classList.add('active');
+  if (b.dataset.tab === 'logs') pollLogs(true);
+});
+
+// ---------- status ----------
+let lastStatus = null;
+async function refreshStatus() {
+  try {
+    const s = await api('/api/status');
+    lastStatus = s;
+    $('#healthDot').style.background = 'var(--accent2)';
+    $('#verText').textContent = 'v' + s.version;
+    $('#stProxy').textContent = s.proxyAddr;
+    $('#stTotal').textContent = s.counters.total;
+    $('#stTunnel').textContent = s.counters.tunnel;
+    $('#stMitm').textContent = s.counters.mitm;
+    $('#stRewrite').textContent = s.counters.rewrite;
+    $('#stErrors').textContent = s.counters.errors;
+    $('#stUptime').textContent = fmtUptime(s.uptimeSec);
+    $('#stDataDir').textContent = s.dataDir;
+    $('#certFp').textContent = s.caSha256;
+    document.title = `(${s.counters.total}) dev-sidecar-rs`;
+    $('#cmdProxy1').textContent = `export https_proxy=http://${s.proxyAddr} http_proxy=http://${s.proxyAddr}`;
+    $('#cmdProxy2').textContent = `git config --global http.https://github.com.proxy http://${s.proxyAddr}`;
+  } catch (e) {
+    $('#healthDot').style.background = 'var(--err)';
+  }
+}
+function fmtUptime(sec) {
+  const d = Math.floor(sec/86400), h = Math.floor(sec%86400/3600), m = Math.floor(sec%3600/60), s = sec%60;
+  return (d ? d + '天 ' : '') + (h ? h + '时 ' : '') + (m ? m + '分 ' : '') + s + '秒';
+}
+async function sysProxy(enable) {
+  try {
+    const r = await api('/api/system-proxy', {
+      method: 'POST', headers: {'content-type': 'application/json'},
+      body: JSON.stringify({ enable })
+    });
+    $('#sysProxyMsg').textContent = (r.messages || []).join(' ');
+    toast(enable ? '已尝试设置系统代理' : '已尝试取消系统代理', !r.ok);
+  } catch (e) { toast('操作失败: ' + e.message, true); }
+}
+
+// ---------- rules ----------
+function actionText(r) {
+  const parts = [];
+  if (r.ipOverride && r.ipOverride.length) parts.push('IP直连×' + r.ipOverride.length);
+  if (r.ipPool && r.ipPool.length) parts.push('IP优选×' + r.ipPool.length);
+  if (r.dnsServers && r.dnsServers.length) parts.push('DNS竞速×' + r.dnsServers.length);
+  if (r.rewriteTo) parts.push('重定向→' + r.rewriteTo + (r.fullUrl ? '(full)' : ''));
+  if (!parts.length) parts.push('仅匹配');
+  return parts.join(' · ');
+}
+function renderRules() {
+  const tb = $('#rulesBody');
+  tb.innerHTML = '';
+  rules.forEach((r, i) => {
+    const tr = document.createElement('tr');
+    tr.innerHTML = `
+      <td><label class="switch"><input type="checkbox" ${r.enabled ? 'checked' : ''} onchange="rules[${i}].enabled=this.checked"><i></i></label></td>
+      <td>${esc(r.name)}</td>
+      <td>${esc(r.hosts.join(', '))}</td>
+      <td>${actionText(r)} ${r.mitm || r.rewriteTo ? '<span class="tag mitm">MITM</span>' : ''}</td>
+      <td>
+        <button class="btn mini ghost" onclick="openRuleEditor(${i})">编辑</button>
+        <button class="btn mini ghost" onclick="moveRule(${i},-1)" ${i === 0 ? 'disabled' : ''} title="上移（命中顺序自上而下）">↑</button>
+        <button class="btn mini ghost" onclick="moveRule(${i},1)" ${i === rules.length - 1 ? 'disabled' : ''} title="下移">↓</button>
+        <button class="btn mini danger" onclick="delRule(${i})">删除</button>
+      </td>`;
+    tb.appendChild(tr);
+  });
+}
+function esc(s) { return String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+async function loadRules() {
+  try { rules = await api('/api/rules'); renderRules(); }
+  catch (e) { toast('规则加载失败: ' + e.message, true); }
+}
+function openRuleEditor(i) {
+  editingIdx = i;
+  const r = rules[i];
+  $('#ruleEditorTitle').textContent = '编辑规则: ' + r.name;
+  $('#fName').value = r.name;
+  $('#fHosts').value = fmtList(r.hosts);
+  $('#fPaths').value = fmtList(r.pathPrefixes);
+  $('#fIps').value = fmtList(r.ipOverride);
+  $('#fPool').value = fmtList(r.ipPool);
+  $('#fDns').value = fmtList(r.dnsServers);
+  $('#fRewrite').value = r.rewriteTo || '';
+  $('#fFullUrl').checked = !!r.fullUrl;
+  $('#fMitm').checked = !!r.mitm;
+  $('#ruleEditor').style.display = '';
+  $('#ruleEditor').scrollIntoView({ behavior: 'smooth' });
+}
+function closeRuleEditor() { $('#ruleEditor').style.display = 'none'; editingIdx = -1; }
+function applyRuleEdit() {
+  const r = editingIdx >= 0 ? rules[editingIdx] : { id: '', enabled: true };
+  r.name = $('#fName').value.trim() || '未命名规则';
+  r.hosts = toList($('#fHosts').value);
+  r.pathPrefixes = toList($('#fPaths').value);
+  r.ipOverride = toList($('#fIps').value);
+  r.ipPool = toList($('#fPool').value);
+  r.dnsServers = toList($('#fDns').value);
+  r.rewriteTo = $('#fRewrite').value.trim();
+  r.fullUrl = $('#fFullUrl').checked;
+  r.mitm = $('#fMitm').checked;
+  if (!r.id) r.id = 'r' + Date.now().toString(16);
+  if (editingIdx < 0) rules.push(r);
+  closeRuleEditor();
+  renderRules();
+}
+function addRule() {
+  rules.push({
+    id: 'r' + Date.now().toString(16), name: '新规则', enabled: true,
+    hosts: [], pathPrefixes: [], ipOverride: [], ipPool: [], dnsServers: [],
+    rewriteTo: '', fullUrl: false, mitm: false,
+  });
+  renderRules();
+  openRuleEditor(rules.length - 1);
+}
+function delRule(i) {
+  if (!confirm('删除规则「' + rules[i].name + '」？')) return;
+  rules.splice(i, 1);
+  renderRules();
+}
+function moveRule(i, d) {
+  const j = i + d;
+  if (j < 0 || j >= rules.length) return;
+  [rules[i], rules[j]] = [rules[j], rules[i]];
+  renderRules();
+}
+async function saveRules() {
+  try {
+    await api('/api/rules', { method: 'PUT', headers: {'content-type': 'application/json'}, body: JSON.stringify(rules) });
+    toast('规则已保存，立即生效');
+  } catch (e) { toast('保存失败: ' + e.message, true); }
+}
+
+// ---------- ip pool ----------
+async function loadIpPool() {
+  if (!$('#tab-rules').classList.contains('active')) return;
+  try {
+    const list = await api('/api/ip-pool');
+    const panel = $('#ipPoolPanel');
+    if (!list.length) { panel.style.display = 'none'; return; }
+    panel.style.display = '';
+    const tb = $('#ipPoolBody');
+    tb.innerHTML = '';
+    for (const it of list) {
+      const tr = document.createElement('tr');
+      tr.innerHTML = `<td>${esc(it.host)}</td>`
+        + `<td>${it.ips.length ? it.ips.map(esc).join(', ') : '<span class="hint">暂无可用</span>'}</td>`
+        + `<td>${it.ips.length}/${it.candidates}</td>`
+        + `<td class="hint">${it.ageSec}s 前</td>`;
+      tb.appendChild(tr);
+    }
+  } catch (e) {}
+}
+
+// ---------- logs ----------
+async function pollLogs(force) {
+  if (!force && !$('#tab-logs').classList.contains('active')) return;
+  try {
+    const r = await api('/api/logs?after=' + logSeq);
+    if (r.entries.length) {
+      logSeq = r.nextSeq;
+      const box = $('#logbox');
+      for (const e of r.entries) {
+        box.appendChild(document.createTextNode(e.line + '\n'));
+        logLines++;
+      }
+      while (logLines > 300) { box.firstChild.remove(); logLines--; }
+      if ($('#logFollow').checked) box.scrollTop = box.scrollHeight;
+    }
+  } catch (e) {}
+}
+
+// ---------- settings ----------
+async function loadSettings() {
+  try {
+    const s = await api('/api/settings');
+    $('#sProxyPort').value = s.proxyPort;
+    $('#sAdminPort').value = s.adminPort;
+    $('#sListenHost').value = s.listenHost;
+    $('#sOpenBrowser').checked = s.openBrowser;
+    $('#sAutoSysProxy').checked = s.autoSystemProxy;
+    $('#sMitmAll').checked = s.mitmAll;
+    $('#sInsecure').checked = s.insecureTls;
+    $('#sDns').value = fmtList(s.defaultDnsServers);
+  } catch (e) { toast('设置加载失败: ' + e.message, true); }
+}
+async function saveSettings() {
+  const body = {
+    listenHost: $('#sListenHost').value.trim() || '127.0.0.1',
+    proxyPort: parseInt($('#sProxyPort').value) || 3128,
+    adminPort: parseInt($('#sAdminPort').value) || 10678,
+    openBrowser: $('#sOpenBrowser').checked,
+    autoSystemProxy: $('#sAutoSysProxy').checked,
+    mitmAll: $('#sMitmAll').checked,
+    insecureTls: $('#sInsecure').checked,
+    defaultDnsServers: toList($('#sDns').value),
+  };
+  try {
+    const r = await api('/api/settings', { method: 'PUT', headers: {'content-type': 'application/json'}, body: JSON.stringify(body) });
+    $('#settingsMsg').textContent = r.restartRequired ? '已保存。端口/地址改动需重启进程生效。' : '已保存。';
+    toast('设置已保存');
+  } catch (e) { toast('保存失败: ' + e.message, true); }
+}
+
+// ---------- init ----------
+refreshStatus();
+loadRules();
+loadSettings();
+setInterval(refreshStatus, 2000);
+setInterval(pollLogs, 1000);
+setInterval(loadIpPool, 5000);
+</script>
+</body>
+</html>
