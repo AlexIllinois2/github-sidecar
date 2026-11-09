@@ -170,11 +170,15 @@ fn main() -> Result<()> {
         println!("──────────────────────────────────────────────");
         tracing::info!("启动完成");
 
-        // 自动设置系统代理
+        // 自动设置系统代理（Linux 下走 PAC：只有规则命中的域名才进侧车）
         let mut proxy_was_set = false;
         if run_settings.auto_system_proxy && !no_system_proxy {
-            let (ok, msgs, backup) =
-                systemproxy::set_system_proxy(&run_settings.listen_host, run_settings.proxy_port);
+            let pac_url = run_settings.pac_url();
+            let (ok, msgs, backup) = systemproxy::set_system_proxy(
+                &run_settings.listen_host,
+                run_settings.proxy_port,
+                &pac_url,
+            );
             for m in &msgs {
                 tracing::info!("{m}");
             }
@@ -215,6 +219,7 @@ fn main() -> Result<()> {
                     &b,
                     &run_settings.listen_host,
                     run_settings.proxy_port,
+                    &run_settings.pac_url(),
                 )
                 .1,
                 None => systemproxy::clear_system_proxy().1,
@@ -236,5 +241,15 @@ impl Settings {
     }
     fn proxy_string(&self) -> String {
         format!("{}:{}", self.listen_host, self.proxy_port)
+    }
+    /// PAC 地址（GNOME「自动代理」模式使用）。监听通配地址时改用回环地址，
+    /// 保证本机浏览器能取到。
+    pub fn pac_url(&self) -> String {
+        let host = if self.listen_host == "0.0.0.0" || self.listen_host == "::" {
+            "127.0.0.1"
+        } else {
+            self.listen_host.as_str()
+        };
+        format!("http://{host}:{}/proxy.pac", self.admin_port)
     }
 }

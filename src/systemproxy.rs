@@ -23,6 +23,7 @@ fn args_str(args: &[&str]) -> String {
 #[derive(Debug, Clone, Default)]
 pub struct ProxyBackup {
     pub mode: String,
+    pub autoconfig_url: String,
     pub http_host: String,
     pub http_port: String,
     pub https_host: String,
@@ -42,6 +43,7 @@ fn gsettings_get(key: &[&str]) -> Option<String> {
 fn snapshot() -> Option<ProxyBackup> {
     Some(ProxyBackup {
         mode: gsettings_get(&["get", "org.gnome.system.proxy", "mode"])?,
+        autoconfig_url: gsettings_get(&["get", "org.gnome.system.proxy", "autoconfig-url"])?,
         http_host: gsettings_get(&["get", "org.gnome.system.proxy.http", "host"])?,
         http_port: gsettings_get(&["get", "org.gnome.system.proxy.http", "port"])?,
         https_host: gsettings_get(&["get", "org.gnome.system.proxy.https", "host"])?,
@@ -50,31 +52,53 @@ fn snapshot() -> Option<ProxyBackup> {
 }
 
 #[cfg(target_os = "linux")]
-pub fn set_system_proxy(host: &str, port: u16) -> (bool, Vec<String>, Option<ProxyBackup>) {
+fn manual_steps(host: &str, port: u16) -> Vec<Vec<String>> {
+    vec![
+        vec!["set".into(), "org.gnome.system.proxy".into(), "mode".into(), "'manual'".into()],
+        vec!["set".into(), "org.gnome.system.proxy.http".into(), "host".into(), format!("'{host}'")],
+        vec!["set".into(), "org.gnome.system.proxy.http".into(), "port".into(), port.to_string()],
+        vec!["set".into(), "org.gnome.system.proxy.https".into(), "host".into(), format!("'{host}'")],
+        vec!["set".into(), "org.gnome.system.proxy.https".into(), "port".into(), port.to_string()],
+    ]
+}
+
+#[cfg(target_os = "linux")]
+pub fn set_system_proxy(
+    host: &str,
+    port: u16,
+    pac_url: &str,
+) -> (bool, Vec<String>, Option<ProxyBackup>) {
     let mut messages = Vec::new();
     let gsettings = |args: &[&str]| run(Command::new("gsettings").args(args));
 
     // 先快照用户原有设置，退出时才能原样恢复（含原有的 manual/auto/none 模式）
     let backup = snapshot();
 
-    let mut ok = true;
-    let steps: Vec<Vec<String>> = vec![
-        vec!["set".into(), "org.gnome.system.proxy".into(), "mode".into(), "'manual'".into()],
-        vec!["set".into(), "org.gnome.system.proxy.http".into(), "host".into(), format!("'{host}'")],
-        vec!["set".into(), "org.gnome.system.proxy.http".into(), "port".into(), port.to_string()],
-        vec!["set".into(), "org.gnome.system.proxy.https".into(), "host".into(), format!("'{host}'")],
-        vec!["set".into(), "org.gnome.system.proxy.https".into(), "port".into(), port.to_string()],
+    // 优先用 PAC 自动代理：只有规则命中的域名走侧车，其余流量直连。
+    // 否则系统里所有流量（Chrome 的 googleapis 等后台请求）都会灌进侧车，
+    // 而这些域名既没有规则、又常常连不通，会把浏览器的连接池拖死。
+    let auto_steps: Vec<Vec<String>> = vec![
+        vec!["set".into(), "org.gnome.system.proxy".into(), "mode".into(), "'auto'".into()],
+        vec![
+            "set".into(),
+            "org.gnome.system.proxy".into(),
+            "autoconfig-url".into(),
+            format!("'{pac_url}'"),
+        ],
     ];
-    for step in steps {
-        let refs: Vec<&str> = step.iter().map(|s| s.as_str()).collect();
-        if let Some(err) = gsettings(&refs) {
-            ok = false;
-            messages.push(format!("gsettings 失败: {err}"));
-            break;
-        }
+    let mut ok = run_steps(&gsettings, &auto_steps, &mut messages);
+    let pac_ok = ok;
+    if !ok {
+        // PAC 不可用（老版本 GNOME 或 schema 缺键）→ 回退为手动代理
+        messages.push("PAC 模式不可用，回退为手动系统代理（全部流量经侧车）".into());
+        ok = run_steps(&gsettings, &manual_steps(host, port), &mut messages);
     }
     if ok {
-        messages.push("已设置 GNOME 系统代理（gsettings）。KDE/其他桌面请手动设置。".into());
+        messages.push(if pac_ok {
+            format!("已设置 GNOME 自动代理（PAC: {pac_url}）：仅规则命中的域名走侧车，其余直连。")
+        } else {
+            "已设置 GNOME 手动系统代理（gsettings）。KDE/其他桌面请手动设置。".into()
+        });
         match &backup {
             Some(b) => messages.push(format!(
                 "已记录退出前的系统代理设置（mode={}），退出时自动恢复。",
@@ -88,40 +112,60 @@ pub fn set_system_proxy(host: &str, port: u16) -> (bool, Vec<String>, Option<Pro
     (ok, messages, backup)
 }
 
-/// 恢复退出前的系统代理。若原设置本身就指向本程序的端口（例如上次运行残留
-/// 或用户手动指向本程序），恢复成它没有意义，退出后只会指向一个已关闭的端口，
+#[cfg(target_os = "linux")]
+fn run_steps(
+    gsettings: &impl Fn(&[&str]) -> Option<String>,
+    steps: &[Vec<String>],
+    messages: &mut Vec<String>,
+) -> bool {
+    for step in steps {
+        let refs: Vec<&str> = step.iter().map(|s| s.as_str()).collect();
+        if let Some(err) = gsettings(&refs) {
+            messages.push(format!("gsettings 失败: {err}"));
+            return false;
+        }
+    }
+    true
+}
+
+/// 恢复退出前的系统代理。若原设置本身就指向本程序（manual 指向本端口，或 auto
+/// 指向本程序的 PAC），恢复成它没有意义——退出后只会指向一个已关闭的服务，
 /// 因此这种情况下置为 none；其他情况原样恢复。
 #[cfg(target_os = "linux")]
-pub fn restore_system_proxy(backup: &ProxyBackup, host: &str, port: u16) -> (bool, Vec<String>) {
+pub fn restore_system_proxy(
+    backup: &ProxyBackup,
+    host: &str,
+    port: u16,
+    pac_url: &str,
+) -> (bool, Vec<String>) {
     if backup.mode.trim().is_empty() {
         return clear_system_proxy();
     }
     let prior_mode = backup.mode.trim_matches('\'');
-    let same_as_ours = prior_mode == "manual"
-        && backup.http_host.trim_matches('\'').eq(host)
-        && backup.http_port.trim() == port.to_string();
+    let same_as_ours = match prior_mode {
+        "manual" => {
+            backup.http_host.trim_matches('\'').eq(host)
+                && backup.http_port.trim() == port.to_string()
+        }
+        "auto" => backup.autoconfig_url.trim_matches('\'').eq(pac_url),
+        _ => false,
+    };
 
     let mut messages = Vec::new();
-    let mut ok = true;
+    let gsettings = |args: &[&str]| run(Command::new("gsettings").args(args));
     let steps: Vec<Vec<String>> = if same_as_ours {
         vec![vec!["set".into(), "org.gnome.system.proxy".into(), "mode".into(), "'none'".into()]]
     } else {
         vec![
             vec!["set".into(), "org.gnome.system.proxy".into(), "mode".into(), backup.mode.clone()],
+            vec!["set".into(), "org.gnome.system.proxy".into(), "autoconfig-url".into(), backup.autoconfig_url.clone()],
             vec!["set".into(), "org.gnome.system.proxy.http".into(), "host".into(), backup.http_host.clone()],
             vec!["set".into(), "org.gnome.system.proxy.http".into(), "port".into(), backup.http_port.clone()],
             vec!["set".into(), "org.gnome.system.proxy.https".into(), "host".into(), backup.https_host.clone()],
             vec!["set".into(), "org.gnome.system.proxy.https".into(), "port".into(), backup.https_port.clone()],
         ]
     };
-    for step in steps {
-        let refs: Vec<&str> = step.iter().map(|s| s.as_str()).collect();
-        if let Some(err) = run(Command::new("gsettings").args(&refs)) {
-            ok = false;
-            messages.push(format!("gsettings 失败: {err}"));
-            break;
-        }
-    }
+    let ok = run_steps(&gsettings, &steps, &mut messages);
     if ok {
         messages.push(if same_as_ours {
             "原系统代理指向本程序，已置为 none（避免退出后指向已关闭的端口）。".into()
@@ -143,7 +187,12 @@ pub fn clear_system_proxy() -> (bool, Vec<String>) {
 }
 
 #[cfg(not(target_os = "linux"))]
-pub fn restore_system_proxy(_backup: &ProxyBackup, _host: &str, _port: u16) -> (bool, Vec<String>) {
+pub fn restore_system_proxy(
+    _backup: &ProxyBackup,
+    _host: &str,
+    _port: u16,
+    _pac_url: &str,
+) -> (bool, Vec<String>) {
     clear_system_proxy()
 }
 
@@ -163,7 +212,7 @@ fn network_services() -> Vec<String> {
 }
 
 #[cfg(target_os = "macos")]
-pub fn set_system_proxy(host: &str, port: u16) -> (bool, Vec<String>, Option<ProxyBackup>) {
+pub fn set_system_proxy(host: &str, port: u16, _pac_url: &str) -> (bool, Vec<String>, Option<ProxyBackup>) {
     let mut messages = Vec::new();
     let mut ok = true;
     for svc in network_services() {
@@ -203,7 +252,7 @@ pub fn clear_system_proxy() -> (bool, Vec<String>) {
 const INET_SETTINGS: &str = r"Software\Microsoft\Windows\CurrentVersion\Internet Settings";
 
 #[cfg(windows)]
-pub fn set_system_proxy(host: &str, port: u16) -> (bool, Vec<String>, Option<ProxyBackup>) {
+pub fn set_system_proxy(host: &str, port: u16, _pac_url: &str) -> (bool, Vec<String>, Option<ProxyBackup>) {
     use winreg::enums::*;
     use winreg::RegKey;
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);

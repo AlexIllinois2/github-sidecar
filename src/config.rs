@@ -173,11 +173,14 @@ impl Config {
         }
     }
 
-    /// 存量配置迁移：旧版内置 github 规则把 github.com 的 IP 池套到
-    /// *.githubusercontent.com / *.githubassets.com / *.github.io（Fastly 承载），
-    /// 探测必然全失败并拖慢首个请求。这里把该规则收敛到 GitHub 边缘域名，
-    /// 并补一条纯 DNS 竞速的 CDN 规则。只在 hosts 与旧默认值完全一致时迁移，
-    /// 用户自己改过域名列表就不动。
+    /// 存量配置迁移：
+    /// 1) 旧版内置 github 规则把 github.com 的 IP 池套到 *.githubusercontent.com /
+    ///    *.githubassets.com / *.github.io（Fastly 承载），探测必然全失败并拖慢首个
+    ///    请求。这里把该规则收敛到 GitHub 边缘域名，并补一条纯 DNS 竞速的 CDN 规则。
+    /// 2) 上一版把 github.com 与 *.github.com 合在一条规则里，导致 api.github.com /
+    ///    等子域也套用主站 IP 池（实测会 301 或 TLS 失败）。这里拆成主站规则 +
+    ///    纯 DNS 的子域规则。
+    /// 只在 hosts 与旧默认值完全一致时迁移，用户自己改过域名列表就不动。
     fn migrate_builtin_rules(&mut self) {
         const LEGACY_GITHUB_HOSTS: &[&str] = &[
             "github.com",
@@ -188,6 +191,8 @@ impl Config {
         ];
         let narrow: &[&str] = &["github.com", "*.github.com"];
         let mut needs_cdn = false;
+        let mut needs_subdomain = false;
+        let mut subdomain_enabled = true;
         for r in &mut self.rules {
             let is_legacy = r.id == "builtin-github"
                 && r.hosts.len() == LEGACY_GITHUB_HOSTS.len()
@@ -198,6 +203,14 @@ impl Config {
                 r.hosts = narrow.iter().map(|s| s.to_string()).collect();
                 needs_cdn = true;
             }
+            let is_narrow = r.id == "builtin-github"
+                && r.hosts.len() == narrow.len()
+                && narrow.iter().all(|h| r.hosts.iter().any(|x| x == h));
+            if is_narrow {
+                r.hosts = vec!["github.com".into()];
+                needs_subdomain = true;
+                subdomain_enabled = r.enabled;
+            }
         }
         if needs_cdn && !self.rules.iter().any(|r| r.id == "builtin-github-cdn") {
             if let Some(cdn) = default_rules()
@@ -205,6 +218,20 @@ impl Config {
                 .find(|r| r.id == "builtin-github-cdn")
             {
                 self.rules.push(cdn);
+            }
+        }
+        if needs_subdomain
+            && !self
+                .rules
+                .iter()
+                .any(|r| r.id == "builtin-github-subdomain")
+        {
+            if let Some(mut sub) = default_rules()
+                .into_iter()
+                .find(|r| r.id == "builtin-github-subdomain")
+            {
+                sub.enabled = subdomain_enabled;
+                self.rules.push(sub);
             }
         }
     }
@@ -259,12 +286,29 @@ pub fn default_rules() -> Vec<Rule> {
     vec![
         rule(
             "builtin-github",
-            "GitHub 加速（IP 优选 + DNS 竞速，无需证书）",
+            "GitHub 主站加速（IP 优选 + DNS 竞速，无需证书）",
             true,
-            &["github.com", "*.github.com"],
+            &["github.com"],
             &[],
             &[],
             GITHUB_IP_POOL,
+            &dns_refs,
+            "",
+            false,
+            false,
+        ),
+        // 子域（api.github.com、gist.github.com、codeload 等）的可用 IP 与 github.com
+        // 主站不是同一套：实测 api 在 20.205.243.168，而池里的 20.205.243.166 /
+        // 20.27.177.113 会 301 回主站、140.82.121.3 直接 TLS 失败。套用主站池会
+        // 把 api 请求拖到 5s+，所以子域只做 DNS 竞速。
+        rule(
+            "builtin-github-subdomain",
+            "GitHub 子域（DNS 竞速，无需证书）",
+            true,
+            &["*.github.com"],
+            &[],
+            &[],
+            &[],
             &dns_refs,
             "",
             false,
@@ -285,10 +329,26 @@ pub fn default_rules() -> Vec<Rule> {
             false,
             false,
         ),
+        // README/页面里的仓库图片普遍指向 raw.githubusercontent.com，该域名在国内常被
+        // SNI 级阻断（TCP 能连、TLS 直接断），盲隧道穿不过去，表现为“图片裂开”。
+        // 只对图片扩展名启用重写，避免影响 raw 的其它用途（代码文件、公式等）。
+        rule(
+            "builtin-github-raw-image",
+            "GitHub raw 图片镜像（经 ghproxy.net，需装 CA）",
+            true,
+            &["raw.githubusercontent.com"],
+            &["*.png", "*.jpg", "*.jpeg", "*.gif", "*.webp", "*.svg", "*.ico", "*.avif"],
+            &[],
+            &[],
+            &[],
+            "https://ghproxy.net",
+            true,
+            true,
+        ),
         rule(
             "builtin-github-release",
-            "GitHub Release/Archive 镜像重定向（需装 CA）",
-            true,
+            "GitHub Release/Archive 镜像重定向（需装 CA，默认关闭）",
+            false,
             &["github.com", "codeload.github.com"],
             &["*releases/download/", "*archive/refs/tags/", "*archive/*.zip", "*archive/*.tar.gz"],
             &[],

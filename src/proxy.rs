@@ -11,9 +11,13 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{HeaderMap, Method, Request, Response, StatusCode, Uri};
 use hyper_util::rt::TokioIo;
+use std::io;
 use std::net::SocketAddr;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::task::{Context, Poll};
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 
@@ -21,6 +25,20 @@ use tokio::net::TcpStream;
 /// 会串行累计到 30s+（正好是"打开很慢"的来源之一）；国内到 GitHub 的 RTT
 /// 通常 200~400ms，1.5s 足够区分"可连"与"被丢包"。
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(1500);
+/// 有规则加速域名（IP 池/DNS 竞速）的整批连接预算
+const CONNECT_BUDGET_ACCEL: Duration = Duration::from_secs(4);
+/// 无规则域名的整体连接预算：系统代理若被配成手动模式，这些域名也会进来，
+/// 必须快速失败，不能靠逐个 IP 串行超时把浏览器的连接池占满。
+const CONNECT_BUDGET_PLAIN: Duration = Duration::from_millis(2500);
+/// 上游「首字节」看门狗：CONNECT 建立后浏览器会立刻发 ClientHello，若选中的 IP
+/// 握手成功但数据面被黑洞（GFW 常见：握手放行、之后字节永不返回），浏览器会一直
+/// 挂到超时。3 秒内上游没有回任何一个字节就判定该 IP 假活，剔除并断开，
+/// 让浏览器立刻换下一个 IP 重试。已有数据往来后由下面的数据面看门狗继续监督。
+const UPSTREAM_FIRST_BYTE_TIMEOUT: Duration = Duration::from_secs(3);
+/// 上游「数据面」看门狗：握手已收到数据后，若客户端在最后一次上游进展之后又发了
+/// 数据，而上游持续静默超过该时长，判定该 IP 数据面停顿（GFW 常见的握手放行、
+/// 之后限速/黑洞）。实测有 0.2s 完成握手却总耗时 3.48s 的样本。
+const UPSTREAM_STALL_TIMEOUT: Duration = Duration::from_secs(3);
 
 pub async fn run(core: Arc<Core>) -> anyhow::Result<()> {
     let settings = core.settings();
@@ -99,6 +117,17 @@ async fn handle_connect(mut req: Request<Incoming>, core: Arc<Core>, peer: Socke
 }
 
 async fn serve_tunnel(core: Arc<Core>, mut client_io: impl AsyncRead + AsyncWrite + Unpin + Send + 'static, host: String, port: u16) {
+    let rule = core.match_rule(&host);
+    let accelerated = rule
+        .as_ref()
+        .map(|r| !r.ip_pool.is_empty() || !r.dns_servers.is_empty())
+        .unwrap_or(false);
+    let budget = if accelerated {
+        CONNECT_BUDGET_ACCEL
+    } else {
+        CONNECT_BUDGET_PLAIN
+    };
+
     let ips = match core.resolve_host(&host).await {
         Ok(ips) => ips,
         Err(e) => {
@@ -109,61 +138,86 @@ async fn serve_tunnel(core: Arc<Core>, mut client_io: impl AsyncRead + AsyncWrit
         }
     };
 
-    let mut target = try_connect_list(&host, port, &ips).await;
+    let mut target = try_connect_list(&host, port, &ips, budget).await;
 
-    // 恢复链：缓存里的优选 IP 可能已整体被墙（TCP 通但数据被丢 / 连接超时）。
-    // 全部失败时强制重测池 → 仍不行再落回 DNS/系统解析，避免缓存挡住可用的兜底路径。
+    // 恢复链：只对"有 IP 池"的加速域名有意义（缓存里的优选 IP 可能已整体被墙）。
+    // 无规则域名不做二次解析重试——同一批 IP 再试一次只会成倍拖长失败时间。
     if target.is_none() {
-        let rule = core.match_rule(&host);
-        if let Some(rule) = rule.as_ref().filter(|r| !r.ip_pool.is_empty()) {
-            let fresh = core.speed.reprobe(&host, &rule.ip_pool).await.unwrap_or_default();
-            if !fresh.is_empty() {
-                tracing::info!("隧道 {host}:{port} 缓存 IP 全部失败，重测后用新优选结果重试");
-                target = try_connect_list(&host, port, &fresh).await;
-            }
-        }
-        // 池重测后仍全部不可用（或无池）→ 落回 DNS/系统解析兜底
-        if target.is_none() {
-            let fallback = if let Some(rule) = rule.as_ref().filter(|r| !r.dns_servers.is_empty()) {
-                core.dns.resolve(&host, &rule.dns_servers).await
-            } else {
-                crate::state::system_resolve(&host).await
-            };
-            if let Ok(fb) = fallback {
-                if !fb.is_empty() {
-                    tracing::info!("隧道 {host}:{port} IP 池不可用，落回 DNS 解析重试");
-                    target = try_connect_list(&host, port, &fb).await;
+        if let Some(rule) = rule.as_ref() {
+            if !rule.ip_pool.is_empty() {
+                let fresh = core.speed.reprobe(&host, &rule.ip_pool).await.unwrap_or_default();
+                if !fresh.is_empty() {
+                    tracing::info!("隧道 {host}:{port} 缓存 IP 全部失败，重测后用新优选结果重试");
+                    target = try_connect_list(&host, port, &fresh, budget).await;
+                }
+                // 池仍不可用 → DNS 竞速兜底。DNS-only 规则的首次解析已经用过 DNS，不再重复。
+                if target.is_none() && !rule.dns_servers.is_empty() {
+                    if let Ok(fb) = core.dns.resolve(&host, &rule.dns_servers).await {
+                        if !fb.is_empty() {
+                            tracing::info!("隧道 {host}:{port} IP 池不可用，落回 DNS 解析重试");
+                            target = try_connect_list(&host, port, &fb, budget).await;
+                        }
+                    }
                 }
             }
         }
     }
 
     match target {
-        Some(mut server) => {
-            tracing::debug!("隧道建立 {host}:{port}");
+        Some((ip, server)) => {
+            tracing::debug!("隧道建立 {host}:{port} → {ip}");
             Counters::inc(&core.counters.tunnel);
-            if let Err(e) = tokio::io::copy_bidirectional(&mut client_io, &mut server).await {
-                tracing::debug!("隧道 {host}:{port} 结束: {e}");
+            match relay(client_io, server).await {
+                TunnelOutcome::Done => {}
+                TunnelOutcome::Stalled => {
+                    tracing::warn!(
+                        "隧道 {host}:{port} 上游 {ip} 在 {:?} 内未返回任何字节（假活/黑洞），已剔除该 IP 并断开，等待浏览器重试",
+                        UPSTREAM_FIRST_BYTE_TIMEOUT
+                    );
+                    core.speed.mark_bad(&host, ip).await;
+                }
+                TunnelOutcome::DataStalled => {
+                    // 单次停顿可能只是 GitHub 侧慢，先断开让浏览器重试；同一 IP 在
+                    // 短窗口内连续两次停顿才判定为坏 IP（避免误杀健康 IP 10 分钟）
+                    tracing::warn!(
+                        "隧道 {host}:{port} 上游 {ip} 数据面停顿超过 {:?}，断开等待浏览器重试",
+                        UPSTREAM_STALL_TIMEOUT
+                    );
+                    core.speed.record_stall(&host, ip).await;
+                }
             }
         }
         None => {
-            tracing::warn!("隧道 {host}:{port} 连不上: 所有候选（优选池/DNS）均失败");
+            if accelerated {
+                tracing::warn!("隧道 {host}:{port} 连不上: 所有候选（优选池/DNS）均失败");
+            } else {
+                tracing::debug!("隧道 {host}:{port} 无规则直连失败（快速失败）");
+            }
             Counters::inc(&core.counters.errors);
             let _ = client_io.shutdown().await;
         }
     }
 }
 
-/// 依次尝试连接 IP 列表（resolve 已按 RTT/优先级排序）
-async fn try_connect_list(host: &str, port: u16, ips: &[std::net::IpAddr]) -> Option<TcpStream> {
+/// 依次尝试连接 IP 列表（resolve 已按 RTT/优先级排序）。
+/// budget 是整批候选的总预算：超出后立即放弃，避免不可达 IP 逐个吃满超时。
+async fn try_connect_list(host: &str, port: u16, ips: &[std::net::IpAddr], budget: Duration) -> Option<(std::net::IpAddr, TcpStream)> {
+    let deadline = Instant::now() + budget;
     let mut last_err = None;
     for ip in ips {
+        let step = match deadline.checked_duration_since(Instant::now()) {
+            Some(remaining) if !remaining.is_zero() => remaining.min(CONNECT_TIMEOUT),
+            _ => {
+                last_err = Some(format!("整批连接预算 {budget:?} 已耗尽"));
+                break;
+            }
+        };
         let addr = SocketAddr::new(*ip, port);
-        match tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(addr)).await {
+        match tokio::time::timeout(step, TcpStream::connect(addr)).await {
             Ok(Ok(s)) => {
                 let _ = s.set_nodelay(true);
                 tracing::debug!("隧道 {host}:{port} → {ip} 连接成功");
-                return Some(s);
+                return Some((*ip, s));
             }
             Ok(Err(e)) => last_err = Some(e.to_string()),
             Err(_) => last_err = Some("连接超时".into()),
@@ -173,6 +227,146 @@ async fn try_connect_list(host: &str, port: u16, ips: &[std::net::IpAddr]) -> Op
         tracing::debug!("隧道 {host}:{port} {} 个候选全部失败（最后错误: {e}）", ips.len());
     }
     None
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TunnelOutcome {
+    Done,
+    /// 上游在首字节超时内没有任何响应（握手成功但数据面黑洞）
+    Stalled,
+    /// 上游已有数据往来后，在客户端再次发数据的情况下持续静默
+    DataStalled,
+}
+
+/// 看门狗判定结果
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StallKind {
+    /// 一个字节都没收到：假活/黑洞，可直接判坏
+    FakeAlive,
+    /// 收到过数据后停顿：可能是瞬时抖动，需累计命中
+    DataStalled,
+}
+
+/// 双向转发，并在整个连接生命周期监督“上游是否在持续推进”。
+/// 空闲超过 IDLE_GIVEUP 且无异常时停止监控，不误杀长连接。
+async fn relay(
+    client_io: impl AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    server: TcpStream,
+) -> TunnelOutcome {
+    let (client_r, mut client_w) = tokio::io::split(client_io);
+    let (server_r, mut server_w) = tokio::io::split(server);
+    let client_bytes = Arc::new(AtomicU64::new(0));
+    let server_bytes = Arc::new(AtomicU64::new(0));
+    let mut client_r = CountingReader {
+        inner: client_r,
+        count: client_bytes.clone(),
+    };
+    let mut server_r = CountingReader {
+        inner: server_r,
+        count: server_bytes.clone(),
+    };
+
+    let c2s = async move {
+        let _ = tokio::io::copy(&mut client_r, &mut server_w).await;
+        let _ = server_w.shutdown().await;
+    };
+    let s2c = async move {
+        let _ = tokio::io::copy(&mut server_r, &mut client_w).await;
+        let _ = client_w.shutdown().await;
+    };
+    tokio::pin!(c2s, s2c);
+
+    let stalled = watchdog(client_bytes.clone(), server_bytes.clone());
+    tokio::pin!(stalled);
+
+    tokio::select! {
+        _ = &mut c2s => return TunnelOutcome::Done,
+        _ = &mut s2c => return TunnelOutcome::Done,
+        kind = &mut stalled => {
+            match kind {
+                Some(StallKind::FakeAlive) => return TunnelOutcome::Stalled,
+                Some(StallKind::DataStalled) => return TunnelOutcome::DataStalled,
+                None => {}
+            }
+        }
+    }
+    // 看门狗已放弃监控（连接空闲或正常）：继续等任一方向自然结束
+    tokio::select! {
+        _ = &mut c2s => {}
+        _ = &mut s2c => {}
+    }
+    TunnelOutcome::Done
+}
+
+/// 上游双向看门狗：
+/// - 首字节阶段：客户端已发数据但上游迟迟一个字节都不回 → 假活
+/// - 数据面阶段：上游已有进展后，客户端又发出了新数据（请求/窗口更新），
+///   而上游持续静默超过 UPSTREAM_STALL_TIMEOUT → 数据面停顿
+/// 完全空闲（双方都无数据变化）超过 IDLE_GIVEUP 则停止监控，不干扰长连接。
+async fn watchdog(client_bytes: Arc<AtomicU64>, server_bytes: Arc<AtomicU64>) -> Option<StallKind> {
+    const TICK: Duration = Duration::from_millis(100);
+    /// 双方都无字节变化的空闲上限：超过即放弃监控，让连接自然存活
+    const IDLE_GIVEUP: Duration = Duration::from_secs(30);
+    let begin = Instant::now();
+    let mut first_send: Option<Instant> = None;
+    let mut last_server = 0u64;
+    let mut last_progress_at = Instant::now();
+    let mut client_at_progress = 0u64;
+    loop {
+        tokio::time::sleep(TICK).await;
+        let client = client_bytes.load(Ordering::Relaxed);
+        let server = server_bytes.load(Ordering::Relaxed);
+
+        if server > last_server {
+            last_server = server;
+            last_progress_at = Instant::now();
+            client_at_progress = client;
+        }
+        if server == 0 {
+            // 尚无任何上游字节：从客户端首次发数据起算首字节超时
+            match first_send {
+                Some(t) if t.elapsed() >= UPSTREAM_FIRST_BYTE_TIMEOUT => {
+                    return Some(StallKind::FakeAlive)
+                }
+                Some(_) => {}
+                None if client > 0 => first_send = Some(Instant::now()),
+                None if begin.elapsed() >= IDLE_GIVEUP => return None,
+                None => {}
+            }
+        } else {
+            // 已收到上游数据：只在客户端“有未回应的新数据”时判停顿，
+            // 避免把合法的慢响应/长连接当成坏 IP
+            if client > client_at_progress && last_progress_at.elapsed() >= UPSTREAM_STALL_TIMEOUT {
+                return Some(StallKind::DataStalled);
+            }
+            if last_progress_at.elapsed() >= IDLE_GIVEUP && client == client_at_progress {
+                return None;
+            }
+        }
+    }
+}
+
+/// 只统计单向字节数，用于判断客户端是否发出数据、上游是否开始回数据
+struct CountingReader<R> {
+    inner: R,
+    count: Arc<AtomicU64>,
+}
+
+impl<R: AsyncRead + Unpin> AsyncRead for CountingReader<R> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        let before = buf.filled().len();
+        let res = Pin::new(&mut this.inner).poll_read(cx, buf);
+        if let Poll::Ready(Ok(())) = &res {
+            this.count
+                .fetch_add((buf.filled().len() - before) as u64, Ordering::Relaxed);
+        }
+        res
+    }
 }
 
 async fn serve_mitm(core: Arc<Core>, stream: impl AsyncRead + AsyncWrite + Unpin + Send + 'static, host: String, peer: SocketAddr) {

@@ -37,6 +37,7 @@ pub fn spawn_admin(core: Arc<Core>) -> anyhow::Result<()> {
                             .service(logs)
                             .service(system_proxy))
                         .service(download_ca)
+                        .service(proxy_pac)
                 })
                 .workers(2)
                 .bind(addr)
@@ -200,9 +201,13 @@ struct SystemProxyReq {
 async fn system_proxy(core: web::Data<Arc<Core>>, body: web::Json<SystemProxyReq>) -> impl Responder {
     let core = admin_core(&core);
     let settings = core.settings();
+    let pac_url = settings.pac_url();
     let (ok, messages) = if body.enable {
-        let (ok, msgs, backup) =
-            crate::systemproxy::set_system_proxy(&settings.listen_host, settings.proxy_port);
+        let (ok, msgs, backup) = crate::systemproxy::set_system_proxy(
+            &settings.listen_host,
+            settings.proxy_port,
+            &pac_url,
+        );
         if ok {
             *core.system_proxy_backup.lock().unwrap() = backup;
         }
@@ -214,6 +219,7 @@ async fn system_proxy(core: web::Data<Arc<Core>>, body: web::Json<SystemProxyReq
                 &b,
                 &settings.listen_host,
                 settings.proxy_port,
+                &pac_url,
             ),
             None => crate::systemproxy::clear_system_proxy(),
         }
@@ -228,4 +234,43 @@ async fn download_ca(core: web::Data<Arc<Core>>) -> impl Responder {
         .content_type("application/x-pem-file")
         .insert_header(("content-disposition", "attachment; filename=\"github-sidecar-ca.crt\""))
         .body(core.ca.ca_pem().to_string())
+}
+
+/// 动态 PAC：只有启用规则命中的域名才走侧车，其余直连。
+/// 系统代理设成「自动」指向这里，Chrome 的 googleapis 等无关流量就不会再进侧车。
+#[get("/proxy.pac")]
+async fn proxy_pac(core: web::Data<Arc<Core>>) -> impl Responder {
+    let core = admin_core(&core);
+    let settings = core.settings();
+    let proxy_host = if settings.listen_host == "0.0.0.0" || settings.listen_host == "::" {
+        "127.0.0.1"
+    } else {
+        settings.listen_host.as_str()
+    };
+    let proxy = format!("{proxy_host}:{}", settings.proxy_port);
+    let mut lines = vec![
+        "function FindProxyForURL(url, host) {".to_string(),
+        "  host = host.toLowerCase();".to_string(),
+    ];
+    for rule in core.rules().into_iter().filter(|r| r.enabled) {
+        for pattern in &rule.hosts {
+            let p = pattern.trim().to_ascii_lowercase();
+            if p.is_empty() {
+                continue;
+            }
+            if p.contains('*') {
+                lines.push(format!(
+                    "  if (shExpMatch(host, \"{p}\")) return \"PROXY {proxy}\";"
+                ));
+            } else {
+                lines.push(format!("  if (host === \"{p}\") return \"PROXY {proxy}\";"));
+            }
+        }
+    }
+    lines.push("  return \"DIRECT\";".to_string());
+    lines.push("}".to_string());
+    HttpResponse::Ok()
+        .content_type("application/x-ns-proxy-autoconfig")
+        .insert_header(("cache-control", "no-cache, max-age=0"))
+        .body(lines.join("\n"))
 }
