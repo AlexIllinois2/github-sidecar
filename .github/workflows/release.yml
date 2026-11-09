@@ -1,0 +1,91 @@
+name: release
+
+# 推送 v* 标签时构建 Linux x86_64 / arm64 二进制并发布 GitHub Release
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  BIN_NAME: github-sidecar
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # x86_64：gnu 动态链接，在 cross 的 Ubuntu 容器里构建，glibc 基线较低（2.31）
+          - target: x86_64-unknown-linux-gnu
+          # arm64：musl 静态链接，单文件可直接分发，无需目标机有对应 glibc
+          - target: aarch64-unknown-linux-musl
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      # 交叉编译统一走 cross（Docker 镜像内置 aarch64 musl 交叉工具链），
+      # 不依赖自托管 arm 机器；x86_64 也走 cross 以获得可复现的旧 glibc 基线
+      - name: Install cross
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+
+      - name: Build
+        run: cross build --release --locked --target ${{ matrix.target }}
+
+      - name: Package
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          name="${BIN_NAME}-${version}-${{ matrix.target }}"
+          mkdir -p "dist" "staging"
+          cp "target/${{ matrix.target }}/release/${BIN_NAME}" staging/
+          tar -C staging -czf "dist/${name}.tar.gz" "${BIN_NAME}"
+          ls -l dist
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: publish release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: List assets
+        run: ls -l dist
+
+      # 两个构建产物合并后再统一生成校验和，避免各 job 互相覆盖
+      - name: Generate checksums
+        run: (cd dist && sha256sum *.tar.gz > SHA256SUMS && cat SHA256SUMS)
+
+      # 标签名即版本；变更说明由 GitHub 自动生成
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          generate_release_notes: true
+          files: dist/*
+          fail_on_unmatched_files: true
