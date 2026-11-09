@@ -140,6 +140,9 @@ pub fn host_matches_pattern(host: &str, pattern: &str) -> bool {
 pub struct Config {
     pub settings: Settings,
     pub rules: Vec<Rule>,
+    /// 已执行的一次性迁移标记。用于区分“升级前自动开启的内置规则”和
+    /// “用户后来手动开启”，避免每次启动都把用户的选择改回去。
+    pub migrations: Vec<String>,
 }
 
 impl Config {
@@ -149,6 +152,10 @@ impl Config {
                 Ok(mut c) => {
                     c.migrate_builtin_rules();
                     c.migrate_builtin_pools();
+                    if c.migrate_retired_defaults() {
+                        // 把一次性迁移标记写回磁盘：之后用户手动开启该规则不会被再次关闭
+                        let _ = c.save(path);
+                    }
                     Ok(c)
                 }
                 Err(e) => {
@@ -159,6 +166,41 @@ impl Config {
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Config::default_with_rules()),
             Err(e) => Err(e),
         }
+    }
+
+    /// 一次性迁移：
+    /// - `builtin-github-raw-image` 曾因修裂图而默认启用（MITM），现已默认关闭；
+    /// - `builtin-github-cdn` 实测直连与经侧车耗时相当（avatars 直连反而更好），
+    ///   CDN 资产域名不再走侧车，避免它成为瓶颈（raw 域名两种路径都被 SNI 阻断，走谁都一样）。
+    /// 只对升级前的存量配置关闭一次并写入标记；之后用户再手动开启不会被强制覆盖。
+    /// 其他规则（含用户自建/修改）不动。返回是否新增了迁移标记（需要落盘）。
+    fn migrate_retired_defaults(&mut self) -> bool {
+        const MARK_RAW: &str = "raw-image-mitm-off";
+        const MARK_CDN: &str = "cdn-direct-v1";
+        let mut changed = false;
+        if !self.migrations.iter().any(|m| m == MARK_RAW) {
+            if let Some(r) = self
+                .rules
+                .iter_mut()
+                .find(|r| r.id == "builtin-github-raw-image")
+            {
+                r.enabled = false;
+            }
+            self.migrations.push(MARK_RAW.into());
+            changed = true;
+        }
+        if !self.migrations.iter().any(|m| m == MARK_CDN) {
+            if let Some(r) = self
+                .rules
+                .iter_mut()
+                .find(|r| r.id == "builtin-github-cdn")
+            {
+                r.enabled = false;
+            }
+            self.migrations.push(MARK_CDN.into());
+            changed = true;
+        }
+        changed
     }
 
     /// 存量配置迁移：内置规则的 IP 池为空而新默认池非空时回填（用户自填的池不动），
@@ -240,6 +282,8 @@ impl Config {
         Self {
             settings: Settings::default(),
             rules: default_rules(),
+            // 全新安装直接带上标记：默认关闭不会影响用户随后手动开启
+            migrations: vec!["raw-image-mitm-off".into(), "cdn-direct-v1".into()],
         }
     }
 
@@ -314,12 +358,13 @@ pub fn default_rules() -> Vec<Rule> {
             false,
             false,
         ),
-        // 这些域名由 Fastly 承载（185.199.x），和 github.com 的 GFE/Azure 边缘 IP 不是一套：
-        // 套用 GitHub 的 IP 池会 100% 探测失败，白白拖慢首个请求，所以只做 DNS 竞速。
+        // Fastly 承载（185.199.x）。实测这些资产域直连与经侧车耗时相当甚至更好
+        // （avatars 经侧车反而会选到黑洞 IP），因此默认不走侧车，让浏览器按系统 DNS 直连；
+        // 需要时可在管理页手动开启做 DNS 竞速。
         rule(
             "builtin-github-cdn",
-            "GitHub 静态资源/raw（DNS 竞速）",
-            true,
+            "GitHub 静态资源/raw（DNS 竞速，默认关闭：直连已足够快）",
+            false,
             &["*.githubusercontent.com", "*.githubassets.com", "*.github.io"],
             &[],
             &[],
@@ -332,10 +377,12 @@ pub fn default_rules() -> Vec<Rule> {
         // README/页面里的仓库图片普遍指向 raw.githubusercontent.com，该域名在国内常被
         // SNI 级阻断（TCP 能连、TLS 直接断），盲隧道穿不过去，表现为“图片裂开”。
         // 只对图片扩展名启用重写，避免影响 raw 的其它用途（代码文件、公式等）。
+        // 默认关闭：只有这一条规则需要 MITM，会解密该域名的所有请求；为修图片
+        // 而让 CA 参与链路、影响不信任我们 CA 的程序不划算，需要时手动开启。
         rule(
             "builtin-github-raw-image",
-            "GitHub raw 图片镜像（经 ghproxy.net，需装 CA）",
-            true,
+            "GitHub raw 图片镜像（经 ghproxy.net，需装 CA，默认关闭）",
+            false,
             &["raw.githubusercontent.com"],
             &["*.png", "*.jpg", "*.jpeg", "*.gif", "*.webp", "*.svg", "*.ico", "*.avif"],
             &[],

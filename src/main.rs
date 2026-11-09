@@ -5,6 +5,7 @@ mod admin;
 mod ca;
 mod config;
 mod dns;
+mod goodip;
 mod logs;
 mod proxy;
 mod speedtest;
@@ -119,7 +120,8 @@ fn main() -> Result<()> {
             }
         });
 
-        // IP 池启动预热：对启用规则里的字面量 host（不含 *）提前测速，首个请求即命中缓存
+        // IP 池启动预热：对启用规则里的字面量 host（不含 *）提前测速，首个请求即命中缓存。
+        // best_ips 会先把落盘的上次可用 IP 拿来用（时间戳记为过期），同时后台真实重测。
         let warm_core = run_core.clone();
         tokio::spawn(async move {
             for rule in warm_core.rules() {
@@ -129,6 +131,18 @@ fn main() -> Result<()> {
                 for host in rule.hosts.iter().filter(|h| !h.contains('*')) {
                     let _ = warm_core.speed.best_ips(host, &rule.ip_pool).await;
                 }
+            }
+            // 只做 DNS 的域名（资产域）：对落盘的上次可用 IP 做一次轻量校验，剔掉已失效的，
+            // 避免下次重试继续撞同一个黑洞 IP。校验在后台跑，不阻塞启动与首个请求。
+            for (host, ips) in warm_core.good.snapshot() {
+                let Some(rule) = warm_core.match_rule(&host).filter(|r| r.enabled) else {
+                    continue;
+                };
+                if !rule.ip_pool.is_empty() {
+                    continue;
+                }
+                let keep = warm_core.speed.validate(&host, &ips).await;
+                warm_core.good.retain(&host, &keep);
             }
         });
 

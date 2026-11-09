@@ -132,11 +132,18 @@
       <div class="card"><div class="k">错误</div><div class="v" id="stErrors">0</div></div>
     </div>
     <div class="panel">
+      <h2>快捷入口</h2>
+      <div class="row">
+        <button class="btn" onclick="openGithub()">打开 GitHub</button>
+        <span class="hint">在新标签页打开 https://github.com（浏览器遵循系统代理时，GitHub 域名会自动经侧车加速）</span>
+      </div>
+    </div>
+    <div class="panel">
       <h2>系统代理</h2>
       <div class="row">
         <button class="btn" onclick="sysProxy(true)">一键设置系统代理</button>
         <button class="btn ghost" onclick="sysProxy(false)">取消系统代理</button>
-        <span class="hint">Linux 走 gsettings（GNOME）；macOS 走 networksetup；Windows 走注册表。退出程序时若由程序设置会自动恢复。</span>
+        <span class="hint">Linux 默认用 GNOME 自动代理（PAC）：仅加速规则命中的域名走侧车，其余流量直连；PAC 不可用时回退为手动代理。macOS 走 networksetup；Windows 走注册表。退出程序时若由程序设置会自动恢复。</span>
       </div>
       <div class="row" style="margin-top:10px">
         <span class="hint" id="sysProxyMsg"></span>
@@ -332,6 +339,9 @@ async function sysProxy(enable) {
     $('#sysProxyMsg').textContent = (r.messages || []).join(' ');
     toast(enable ? '已尝试设置系统代理' : '已尝试取消系统代理', !r.ok);
   } catch (e) { toast('操作失败: ' + e.message, true); }
+}
+function openGithub() {
+  window.open('https://github.com', '_blank', 'noopener');
 }
 
 // ---------- rules ----------

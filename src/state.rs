@@ -3,6 +3,7 @@
 use crate::ca::CaManager;
 use crate::config::{Config, Rule, Settings};
 use crate::dns::DnsResolver;
+use crate::goodip::LastGood;
 use crate::logs::LogBuffer;
 use crate::speedtest::IpSpeedTester;
 
@@ -55,6 +56,8 @@ pub struct Core {
     pub cfg_path: PathBuf,
     pub dns: DnsResolver,
     pub speed: Arc<IpSpeedTester>,
+    /// 最近真正可用的 IP（按域名落盘，冷启动复用）
+    pub good: Arc<LastGood>,
     pub ca: CaManager,
     pub logs: Arc<LogBuffer>,
     pub started: Instant,
@@ -67,11 +70,20 @@ pub struct Core {
 impl Core {
     pub fn new(cfg: Config, cfg_path: PathBuf, ca: CaManager, logs: Arc<LogBuffer>) -> Arc<Self> {
         let tls = Arc::new(upstream_tls_config(&cfg.settings));
+        let data_dir = cfg_path
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| PathBuf::from("."));
+        let good = Arc::new(LastGood::load(data_dir.join("last-good.json")));
         let core = Arc::new(Self {
             cfg: std::sync::RwLock::new(cfg),
             cfg_path,
             dns: DnsResolver::new(),
-            speed: Arc::new(IpSpeedTester::new(tokio_rustls::TlsConnector::from(tls))),
+            speed: Arc::new(IpSpeedTester::new(
+                tokio_rustls::TlsConnector::from(tls),
+                good.clone(),
+            )),
+            good,
             ca,
             logs,
             started: Instant::now(),
@@ -122,11 +134,13 @@ impl Core {
         })
     }
 
-    /// 完整解析策略：规则 ip_override → 规则 IP 池测速优选 → 规则 DNS 竞速 → 系统解析
+    /// 完整解析策略：规则 ip_override → 规则 IP 池测速优选 → 上次可用 IP + DNS 竞速 → 系统解析。
+    /// 所有候选都会按 (host, IP) 剔除冷却期内的坏 IP（全部命中冷却则退回原列表）。
     pub async fn resolve_host(&self, host: &str) -> io::Result<Vec<IpAddr>> {
         if let Ok(ip) = host.parse::<IpAddr>() {
             return Ok(vec![ip]);
         }
+        let last_good = self.good.ips(host);
         if let Some(rule) = self.match_rule(host) {
             let ips: Vec<IpAddr> = rule
                 .ip_override
@@ -139,16 +153,40 @@ impl Core {
             if !rule.ip_pool.is_empty() {
                 if let Ok(ranked) = self.speed.best_ips(host, &rule.ip_pool).await {
                     if !ranked.is_empty() {
-                        return Ok(ranked);
+                        return Ok(self.speed.filter_bad(host, ranked));
                     }
                 }
-                // 池内候选全部不可达 → 落回 DNS 竞速兜底
+                // 池内候选全部不可达 → 上次可用 IP + DNS 竞速兜底
             }
             if !rule.dns_servers.is_empty() {
-                return self.dns.resolve(host, &rule.dns_servers).await;
+                if let Ok(dns) = self.dns.resolve(host, &rule.dns_servers).await {
+                    let merged = self.merge_candidates(host, &last_good, dns);
+                    if !merged.is_empty() {
+                        return Ok(merged);
+                    }
+                }
             }
         }
-        system_resolve(host).await
+        let sys = system_resolve(host).await.unwrap_or_default();
+        let merged = self.merge_candidates(host, &last_good, sys);
+        if merged.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("{host} 解析无结果"),
+            ));
+        }
+        Ok(merged)
+    }
+
+    /// 上次可用 IP 排在最前（竞速时先试它），后面接 DNS/系统解析结果；去重后剔除冷却期坏 IP
+    fn merge_candidates(&self, host: &str, last_good: &[IpAddr], rest: Vec<IpAddr>) -> Vec<IpAddr> {
+        let mut out: Vec<IpAddr> = Vec::with_capacity(last_good.len() + rest.len());
+        for ip in last_good.iter().copied().chain(rest) {
+            if !out.contains(&ip) {
+                out.push(ip);
+            }
+        }
+        self.speed.filter_bad(host, out)
     }
 }
 

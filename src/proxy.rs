@@ -4,6 +4,7 @@
 
 use crate::state::{BoxBody, Core, Counters};
 use bytes::Bytes;
+use futures_util::stream::{FuturesUnordered, StreamExt};
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::header::{HOST, LOCATION};
@@ -39,6 +40,9 @@ const UPSTREAM_FIRST_BYTE_TIMEOUT: Duration = Duration::from_secs(3);
 /// 数据，而上游持续静默超过该时长，判定该 IP 数据面停顿（GFW 常见的握手放行、
 /// 之后限速/黑洞）。实测有 0.2s 完成握手却总耗时 3.48s 的样本。
 const UPSTREAM_STALL_TIMEOUT: Duration = Duration::from_secs(3);
+/// 上游 TLS application data 至少这么多字节才算“真的响应了本请求”。
+/// HTTP 响应头首发 record 通常远超此值；TLS 票据/握手尾包是 0x16，不计入。
+const RESPONSE_PROOF_BYTES: u64 = 64;
 
 pub async fn run(core: Arc<Core>) -> anyhow::Result<()> {
     let settings = core.settings();
@@ -167,7 +171,12 @@ async fn serve_tunnel(core: Arc<Core>, mut client_io: impl AsyncRead + AsyncWrit
         Some((ip, server)) => {
             tracing::debug!("隧道建立 {host}:{port} → {ip}");
             Counters::inc(&core.counters.tunnel);
-            match relay(client_io, server).await {
+            let (outcome, responded) = relay(client_io, server).await;
+            if responded {
+                // 这条连接真的拿到了上游响应：把 IP 记进“上次可用”，下次冷启动直接用
+                core.speed.record_good(&host, ip, "tunnel");
+            }
+            match outcome {
                 TunnelOutcome::Done => {}
                 TunnelOutcome::Stalled => {
                     tracing::warn!(
@@ -199,34 +208,63 @@ async fn serve_tunnel(core: Arc<Core>, mut client_io: impl AsyncRead + AsyncWrit
     }
 }
 
-/// 依次尝试连接 IP 列表（resolve 已按 RTT/优先级排序）。
-/// budget 是整批候选的总预算：超出后立即放弃，避免不可达 IP 逐个吃满超时。
+/// 请求路径上的并行建连数量。实测同一时刻常有大量候选 IP 的 TCP SYN 被丢弃，
+/// 逐个串行尝试会把 4 秒预算全耗在“等第一个 IP 超时”上；前 8 个并行竞速，
+/// 任意一个建连成功就立即返回，最坏等待接近单个 CONNECT_TIMEOUT 而不是 N 倍。
+/// 实测坏窗口里 12 个候选常只有 1 个可用，只竞赛前 4 个会漏掉它。
+const CONNECT_RACE: usize = 8;
+/// 并行竞速时后续候选的轻微延迟，保留“优先前面的候选”的顺序语义（happy eyeballs）
+const CONNECT_RACE_STAGGER: Duration = Duration::from_millis(60);
+
+/// 并行尝试前 N 个候选 IP，返回最先建连成功的那个。
+/// 空列表/全部失败返回 None；整批仍受 budget 约束，不会无限等待。
 async fn try_connect_list(host: &str, port: u16, ips: &[std::net::IpAddr], budget: Duration) -> Option<(std::net::IpAddr, TcpStream)> {
-    let deadline = Instant::now() + budget;
-    let mut last_err = None;
-    for ip in ips {
-        let step = match deadline.checked_duration_since(Instant::now()) {
-            Some(remaining) if !remaining.is_zero() => remaining.min(CONNECT_TIMEOUT),
-            _ => {
-                last_err = Some(format!("整批连接预算 {budget:?} 已耗尽"));
-                break;
+    if ips.is_empty() {
+        return None;
+    }
+    let mut futs = FuturesUnordered::new();
+    for (idx, ip) in ips.iter().take(CONNECT_RACE).enumerate() {
+        let ip = *ip;
+        futs.push(async move {
+            if idx > 0 {
+                tokio::time::sleep(CONNECT_RACE_STAGGER * idx as u32).await;
             }
-        };
-        let addr = SocketAddr::new(*ip, port);
-        match tokio::time::timeout(step, TcpStream::connect(addr)).await {
-            Ok(Ok(s)) => {
-                let _ = s.set_nodelay(true);
-                tracing::debug!("隧道 {host}:{port} → {ip} 连接成功");
-                return Some((*ip, s));
+            let addr = SocketAddr::new(ip, port);
+            match tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(addr)).await {
+                Ok(Ok(s)) => {
+                    let _ = s.set_nodelay(true);
+                    Some((ip, s))
+                }
+                _ => None,
             }
-            Ok(Err(e)) => last_err = Some(e.to_string()),
-            Err(_) => last_err = Some("连接超时".into()),
+        });
+    }
+    let raced = tokio::time::timeout(budget, async {
+        while let Some(found) = futs.next().await {
+            if let Some(v) = found {
+                return Some(v);
+            }
+        }
+        None
+    })
+    .await;
+    match raced {
+        Ok(Some(v)) => {
+            tracing::debug!("隧道 {host}:{port} → {} 并行竞速建连成功", v.0);
+            Some(v)
+        }
+        Ok(None) => {
+            tracing::debug!(
+                "隧道 {host}:{port} 前 {} 个候选全部失败",
+                ips.len().min(CONNECT_RACE)
+            );
+            None
+        }
+        Err(_) => {
+            tracing::debug!("隧道 {host}:{port} 并行建连预算 {budget:?} 已耗尽");
+            None
         }
     }
-    if let Some(e) = last_err {
-        tracing::debug!("隧道 {host}:{port} {} 个候选全部失败（最后错误: {e}）", ips.len());
-    }
-    None
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -252,19 +290,17 @@ enum StallKind {
 async fn relay(
     client_io: impl AsyncRead + AsyncWrite + Unpin + Send + 'static,
     server: TcpStream,
-) -> TunnelOutcome {
+) -> (TunnelOutcome, bool) {
     let (client_r, mut client_w) = tokio::io::split(client_io);
     let (server_r, mut server_w) = tokio::io::split(server);
     let client_bytes = Arc::new(AtomicU64::new(0));
     let server_bytes = Arc::new(AtomicU64::new(0));
-    let mut client_r = CountingReader {
-        inner: client_r,
-        count: client_bytes.clone(),
-    };
-    let mut server_r = CountingReader {
-        inner: server_r,
-        count: server_bytes.clone(),
-    };
+    // TLS application-data 字节数（record type 0x17）：用来区分“真正的 HTTP 请求/响应”
+    // 和 TLS 1.3 NewSessionTicket 这类握手尾包（0x16），避免后者把停顿判定重置掉。
+    let client_app = Arc::new(AtomicU64::new(0));
+    let server_app = Arc::new(AtomicU64::new(0));
+    let mut client_r = CountingReader::new(client_r, client_bytes.clone(), client_app.clone());
+    let mut server_r = CountingReader::new(server_r, server_bytes.clone(), server_app.clone());
 
     let c2s = async move {
         let _ = tokio::io::copy(&mut client_r, &mut server_w).await;
@@ -276,54 +312,106 @@ async fn relay(
     };
     tokio::pin!(c2s, s2c);
 
-    let stalled = watchdog(client_bytes.clone(), server_bytes.clone());
+    let stalled = watchdog(
+        client_bytes.clone(),
+        server_bytes.clone(),
+        client_app.clone(),
+        server_app.clone(),
+    );
     tokio::pin!(stalled);
 
-    tokio::select! {
-        _ = &mut c2s => return TunnelOutcome::Done,
-        _ = &mut s2c => return TunnelOutcome::Done,
-        kind = &mut stalled => {
-            match kind {
-                Some(StallKind::FakeAlive) => return TunnelOutcome::Stalled,
-                Some(StallKind::DataStalled) => return TunnelOutcome::DataStalled,
-                None => {}
+    let outcome = 'relay: {
+        tokio::select! {
+            _ = &mut c2s => break 'relay TunnelOutcome::Done,
+            _ = &mut s2c => break 'relay TunnelOutcome::Done,
+            kind = &mut stalled => {
+                match kind {
+                    Some(StallKind::FakeAlive) => break 'relay TunnelOutcome::Stalled,
+                    Some(StallKind::DataStalled) => break 'relay TunnelOutcome::DataStalled,
+                    None => {}
+                }
             }
         }
-    }
-    // 看门狗已放弃监控（连接空闲或正常）：继续等任一方向自然结束
-    tokio::select! {
-        _ = &mut c2s => {}
-        _ = &mut s2c => {}
-    }
-    TunnelOutcome::Done
+        // 看门狗已放弃监控（连接空闲或正常）：继续等任一方向自然结束
+        tokio::select! {
+            _ = &mut c2s => {}
+            _ = &mut s2c => {}
+        }
+        TunnelOutcome::Done
+    };
+    // 上游真的回过应用层数据（>= 一个响应的量级）才值得记入“上次可用 IP”
+    let responded = server_app.load(Ordering::Relaxed) >= RESPONSE_PROOF_BYTES;
+    (outcome, responded)
 }
 
 /// 上游双向看门狗：
 /// - 首字节阶段：客户端已发数据但上游迟迟一个字节都不回 → 假活
-/// - 数据面阶段：上游已有进展后，客户端又发出了新数据（请求/窗口更新），
-///   而上游持续静默超过 UPSTREAM_STALL_TIMEOUT → 数据面停顿
-/// 完全空闲（双方都无数据变化）超过 IDLE_GIVEUP 则停止监控，不干扰长连接。
-async fn watchdog(client_bytes: Arc<AtomicU64>, server_bytes: Arc<AtomicU64>) -> Option<StallKind> {
+/// - 数据面阶段：客户端发出“请求级”的 TLS application data 后，上游在 3 秒内
+///   app data 不足 64 字节 → 数据面停顿。
+///
+/// 判据只认 TLS record type 0x17（application data），不认总字节：
+/// TLS 1.3 的 NewSessionTicket / KeyUpdate 等握手尾包（0x16）会在请求之后到达，
+/// 按总字节计时会被这几十字节“重置”，黑洞连接于是永不被判停顿（实测挂到 12s）；
+/// 而服务端的 HTTP/2 SETTINGS 之类 app data 在请求之前就已到达，arm 时已计入基线，
+/// 也不会伪装成“对本请求的响应”。
+///
+/// 完全空闲（双方都无字节变化）超过 IDLE_GIVEUP 则停止监控，不干扰长连接。
+async fn watchdog(
+    client_bytes: Arc<AtomicU64>,
+    server_bytes: Arc<AtomicU64>,
+    client_app: Arc<AtomicU64>,
+    server_app: Arc<AtomicU64>,
+) -> Option<StallKind> {
     const TICK: Duration = Duration::from_millis(100);
     /// 双方都无字节变化的空闲上限：超过即放弃监控，让连接自然存活
     const IDLE_GIVEUP: Duration = Duration::from_secs(30);
+    /// 自客户端发出 app data 以来，上游至少回这么多 app 字节才算“真的有响应”
+    const RESPONSE_PROOF: u64 = RESPONSE_PROOF_BYTES;
     let begin = Instant::now();
     let mut first_send: Option<Instant> = None;
+    let mut last_client = 0u64;
     let mut last_server = 0u64;
-    let mut last_progress_at = Instant::now();
-    let mut client_at_progress = 0u64;
+    let mut last_client_app = 0u64;
+    let mut last_server_app = 0u64;
+    let mut last_activity = Instant::now();
+    // 客户端发出请求数据但上游尚未证明有响应：(arm 时间, arm 时的上游 app 字节基线)
+    let mut pending: Option<(Instant, u64)> = None;
     loop {
         tokio::time::sleep(TICK).await;
+        let now = Instant::now();
         let client = client_bytes.load(Ordering::Relaxed);
         let server = server_bytes.load(Ordering::Relaxed);
+        let capp = client_app.load(Ordering::Relaxed);
+        let sapp = server_app.load(Ordering::Relaxed);
 
+        if client > last_client {
+            last_client = client;
+            last_activity = now;
+        }
+        // 只有应用层数据（真正的 HTTP 请求/请求体）才开启一轮“等响应”计时
+        if capp > last_client_app {
+            last_client_app = capp;
+            last_activity = now;
+            if pending.is_none() {
+                pending = Some((now, sapp));
+            }
+        }
+        if sapp > last_server_app {
+            last_server_app = sapp;
+            last_activity = now;
+            if let Some((_, base)) = pending {
+                if sapp.saturating_sub(base) >= RESPONSE_PROOF {
+                    pending = None;
+                }
+            }
+        }
         if server > last_server {
             last_server = server;
-            last_progress_at = Instant::now();
-            client_at_progress = client;
+            last_activity = now;
         }
+
         if server == 0 {
-            // 尚无任何上游字节：从客户端首次发数据起算首字节超时
+            // 尚无任何上游字节（TLS 握手都没开始回）：从客户端首次发数据起算首字节超时
             match first_send {
                 Some(t) if t.elapsed() >= UPSTREAM_FIRST_BYTE_TIMEOUT => {
                     return Some(StallKind::FakeAlive)
@@ -333,23 +421,109 @@ async fn watchdog(client_bytes: Arc<AtomicU64>, server_bytes: Arc<AtomicU64>) ->
                 None if begin.elapsed() >= IDLE_GIVEUP => return None,
                 None => {}
             }
-        } else {
-            // 已收到上游数据：只在客户端“有未回应的新数据”时判停顿，
-            // 避免把合法的慢响应/长连接当成坏 IP
-            if client > client_at_progress && last_progress_at.elapsed() >= UPSTREAM_STALL_TIMEOUT {
+            continue;
+        }
+
+        if let Some((at, base)) = pending {
+            if now.duration_since(at) >= UPSTREAM_STALL_TIMEOUT
+                && sapp.saturating_sub(base) < RESPONSE_PROOF
+            {
                 return Some(StallKind::DataStalled);
             }
-            if last_progress_at.elapsed() >= IDLE_GIVEUP && client == client_at_progress {
+            // 长时间悬而未决（例如持续慢请求）也不要无限占用看门狗
+            if now.duration_since(at) >= IDLE_GIVEUP {
                 return None;
             }
+        } else if now.duration_since(last_activity) >= IDLE_GIVEUP {
+            return None;
         }
     }
 }
 
-/// 只统计单向字节数，用于判断客户端是否发出数据、上游是否开始回数据
+/// TLS record 头长度：type(1) + version(2) + length(2)
+const TLS_RECORD_HEADER: usize = 5;
+/// TLS record type: application data
+const TLS_TYPE_APPLICATION_DATA: u8 = 0x17;
+/// TLS record type: handshake（含 ClientHello / ServerHello / NewSessionTicket）
+const TLS_TYPE_HANDSHAKE: u8 = 0x16;
+
+/// 透传读取，同时统计两类字节：
+/// - `total`：原始字节数（用于判断上游是否“有任何”回包）
+/// - `app`：TLS application data（type 0x17）的 payload 字节数，
+///   用于判断“请求是否真的拿到了响应”。非 TLS（明文隧道）时 `app` 等于 `total`。
+///
+/// 逐 record 解析，不缓存 payload 本体；record 头可能跨多次 read，用 header 数组累积。
+/// 只有首批字节以 0x16 开头才启用 TLS 解析（TLS 所有版本 record 都以 0x16 0x03 起），
+/// 否则按明文处理。
 struct CountingReader<R> {
     inner: R,
-    count: Arc<AtomicU64>,
+    total: Arc<AtomicU64>,
+    app: Arc<AtomicU64>,
+    /// Some(true)=按 TLS record 解析；Some(false)=明文；None=还没见到首批字节
+    tls: Option<bool>,
+    header: [u8; TLS_RECORD_HEADER],
+    header_len: usize,
+    /// 当前 record payload 还剩多少字节未消费
+    skip: usize,
+    /// 正在消费的 record 是否为 application data
+    payload_app: bool,
+}
+
+impl<R> CountingReader<R> {
+    fn new(inner: R, total: Arc<AtomicU64>, app: Arc<AtomicU64>) -> Self {
+        Self {
+            inner,
+            total,
+            app,
+            tls: None,
+            header: [0; TLS_RECORD_HEADER],
+            header_len: 0,
+            skip: 0,
+            payload_app: false,
+        }
+    }
+
+    /// 解析一段新读到的字节，累计 app data 字节数。
+    fn consume(&mut self, data: &[u8]) {
+        if data.is_empty() {
+            return;
+        }
+        if self.tls.is_none() {
+            self.tls = Some(data[0] == TLS_TYPE_HANDSHAKE);
+        }
+        if self.tls != Some(true) {
+            // 明文：所有字节都是应用数据
+            self.app.fetch_add(data.len() as u64, Ordering::Relaxed);
+            return;
+        }
+        let mut i = 0;
+        while i < data.len() {
+            if self.skip > 0 {
+                let n = self.skip.min(data.len() - i);
+                if self.payload_app {
+                    self.app.fetch_add(n as u64, Ordering::Relaxed);
+                }
+                self.skip -= n;
+                i += n;
+                continue;
+            }
+            let need = TLS_RECORD_HEADER - self.header_len;
+            let take = need.min(data.len() - i);
+            self.header[self.header_len..self.header_len + take]
+                .copy_from_slice(&data[i..i + take]);
+            self.header_len += take;
+            i += take;
+            if self.header_len < TLS_RECORD_HEADER {
+                // 头还没凑齐，等下一次 read
+                break;
+            }
+            let content_type = self.header[0];
+            let len = u16::from_be_bytes([self.header[3], self.header[4]]) as usize;
+            self.payload_app = content_type == TLS_TYPE_APPLICATION_DATA;
+            self.skip = len;
+            self.header_len = 0;
+        }
+    }
 }
 
 impl<R: AsyncRead + Unpin> AsyncRead for CountingReader<R> {
@@ -362,8 +536,12 @@ impl<R: AsyncRead + Unpin> AsyncRead for CountingReader<R> {
         let before = buf.filled().len();
         let res = Pin::new(&mut this.inner).poll_read(cx, buf);
         if let Poll::Ready(Ok(())) = &res {
-            this.count
-                .fetch_add((buf.filled().len() - before) as u64, Ordering::Relaxed);
+            // filled 借用的是 buf（与 self 无关），consume 只写 self，借用不冲突
+            let filled = &buf.filled()[before..];
+            if !filled.is_empty() {
+                this.total.fetch_add(filled.len() as u64, Ordering::Relaxed);
+                this.consume(filled);
+            }
         }
         res
     }

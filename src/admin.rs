@@ -238,6 +238,7 @@ async fn download_ca(core: web::Data<Arc<Core>>) -> impl Responder {
 
 /// 动态 PAC：只有启用规则命中的域名才走侧车，其余直连。
 /// 系统代理设成「自动」指向这里，Chrome 的 googleapis 等无关流量就不会再进侧车。
+/// 代理不可达时追加 DIRECT 回退：侧车意外退出也不会让 GitHub 域名彻底断网。
 #[get("/proxy.pac")]
 async fn proxy_pac(core: web::Data<Arc<Core>>) -> impl Responder {
     let core = admin_core(&core);
@@ -248,6 +249,7 @@ async fn proxy_pac(core: web::Data<Arc<Core>>) -> impl Responder {
         settings.listen_host.as_str()
     };
     let proxy = format!("{proxy_host}:{}", settings.proxy_port);
+    let route = format!("PROXY {proxy}; DIRECT");
     let mut lines = vec![
         "function FindProxyForURL(url, host) {".to_string(),
         "  host = host.toLowerCase();".to_string(),
@@ -260,10 +262,10 @@ async fn proxy_pac(core: web::Data<Arc<Core>>) -> impl Responder {
             }
             if p.contains('*') {
                 lines.push(format!(
-                    "  if (shExpMatch(host, \"{p}\")) return \"PROXY {proxy}\";"
+                    "  if (shExpMatch(host, \"{p}\")) return \"{route}\";"
                 ));
             } else {
-                lines.push(format!("  if (host === \"{p}\") return \"PROXY {proxy}\";"));
+                lines.push(format!("  if (host === \"{p}\") return \"{route}\";"));
             }
         }
     }
