@@ -10,15 +10,20 @@ use rustls_pki_types::ServerName;
 use std::collections::HashMap;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
 use tokio::sync::RwLock;
 use tokio_rustls::TlsConnector;
 
-/// 单个候选 IP 的建连超时（TCP + TLS 握手总计）
-const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
-/// 测速结果缓存时长，过期后下次请求触发重测
+/// 单个候选 IP 的 TCP / TLS 单步超时
+const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+/// 单个候选 IP 的探测总截止时间（TCP + TLS 合计），避免不可用 IP 串行拖慢首个请求
+const PROBE_DEADLINE: Duration = Duration::from_secs(3);
+/// 测速结果缓存时长，过期后后台重测（stale-while-revalidate，不再阻塞请求）
 const CACHE_TTL: Duration = Duration::from_secs(300);
+/// 同一 host 两次强制重测的最小间隔，避免并发失败请求各自触发一轮探测
+const REPROBE_MIN_INTERVAL: Duration = Duration::from_secs(2);
 const PROBE_PORT: u16 = 443;
 
 #[derive(Debug, Clone)]
@@ -42,6 +47,8 @@ pub struct PoolStatus {
 
 pub struct IpSpeedTester {
     cache: RwLock<HashMap<String, CacheEntry>>,
+    /// 每个 host 一把探测锁：并发请求只允许一个真正探测，其余等待后复用结果
+    gates: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     tls: TlsConnector,
 }
 
@@ -49,22 +56,65 @@ impl IpSpeedTester {
     pub fn new(tls: TlsConnector) -> Self {
         Self {
             cache: RwLock::new(HashMap::new()),
+            gates: Mutex::new(HashMap::new()),
             tls,
         }
     }
 
-    /// 返回该 host 当前可用的 IP（按 RTT 升序）。缓存新鲜则直接命中，
-    /// 否则对池内候选并发测速并缓存。全部候选失败时返回空列表（调用方落回 DNS 竞速）。
-    pub async fn best_ips(&self, host: &str, pool: &[String]) -> io::Result<Vec<IpAddr>> {
-        if let Some(ips) = self.fresh(host).await {
-            return Ok(ips);
+    /// 返回该 host 当前可用的 IP（按 RTT 升序）。
+    /// - 缓存新鲜：直接命中
+    /// - 缓存过期：立即返回旧值并在后台单飞重测（不阻塞请求）
+    /// - 无缓存：单飞探测并等待结果
+    /// 全部候选失败时返回空列表（调用方落回 DNS 竞速）。
+    pub async fn best_ips(self: &Arc<Self>, host: &str, pool: &[String]) -> io::Result<Vec<IpAddr>> {
+        if let Some(entry) = self.cached(host).await {
+            if entry.tested_at.elapsed() < CACHE_TTL {
+                return Ok(entry.ips);
+            }
+            self.spawn_refresh(host.to_string(), pool.to_vec());
+            return Ok(entry.ips);
         }
-        self.reprobe(host, pool).await
+        self.refresh(host, pool, false).await
     }
 
     /// 忽略缓存强制重测。连接失败后调用：缓存里的"最优 IP"可能已整体被墙，
     /// 重测既能恢复也能及时暴露"全死"状态（返回空 → 调用方落回 DNS 兜底）。
-    pub async fn reprobe(&self, host: &str, pool: &[String]) -> io::Result<Vec<IpAddr>> {
+    /// 并发调用会被单飞合并；同一 host 在 REPROBE_MIN_INTERVAL 内不会重复探测。
+    pub async fn reprobe(self: &Arc<Self>, host: &str, pool: &[String]) -> io::Result<Vec<IpAddr>> {
+        self.refresh(host, pool, true).await
+    }
+
+    async fn refresh(self: &Arc<Self>, host: &str, pool: &[String], force: bool) -> io::Result<Vec<IpAddr>> {
+        let gate = self.gate(host);
+        let _guard = gate.lock().await;
+        if let Some(entry) = self.cached(host).await {
+            let age = entry.tested_at.elapsed();
+            let usable = if force {
+                age < REPROBE_MIN_INTERVAL
+            } else {
+                age < CACHE_TTL
+            };
+            if usable {
+                return Ok(entry.ips);
+            }
+        }
+        self.probe_and_cache(host, pool).await
+    }
+
+    /// 后台单飞刷新：多个并发请求只会有一个真正探测，其余发现刚测过就直接返回。
+    fn spawn_refresh(self: &Arc<Self>, host: String, pool: Vec<String>) {
+        let this = self.clone();
+        tokio::spawn(async move {
+            let gate = this.gate(&host);
+            let _guard = gate.lock().await;
+            if this.recent(&host, REPROBE_MIN_INTERVAL).await {
+                return;
+            }
+            let _ = this.probe_and_cache(&host, &pool).await;
+        });
+    }
+
+    async fn probe_and_cache(&self, host: &str, pool: &[String]) -> io::Result<Vec<IpAddr>> {
         let candidates = parse_pool(pool);
         if candidates.is_empty() {
             return Ok(vec![]);
@@ -98,7 +148,7 @@ impl IpSpeedTester {
 
     /// 背景刷新：对缓存中已过 TTL 的条目用当前规则池重测；
     /// 规则被删/禁用/池被清空的条目直接移除。get_pool 返回 None 或空池均视为移除。
-    pub async fn retest_stale(&self, get_pool: impl Fn(&str) -> Option<Vec<String>>) {
+    pub async fn retest_stale(self: &Arc<Self>, get_pool: impl Fn(&str) -> Option<Vec<String>>) {
         let stale: Vec<String> = {
             let cache = self.cache.read().await;
             cache
@@ -110,7 +160,7 @@ impl IpSpeedTester {
         for host in stale {
             match get_pool(&host) {
                 Some(pool) if !pool.is_empty() => {
-                    let _ = self.best_ips(&host, &pool).await;
+                    let _ = self.reprobe(&host, &pool).await;
                 }
                 _ => {
                     self.cache.write().await.remove(&host);
@@ -134,12 +184,25 @@ impl IpSpeedTester {
         v
     }
 
-    async fn fresh(&self, host: &str) -> Option<Vec<IpAddr>> {
-        let cache = self.cache.read().await;
-        cache
-            .get(host)
-            .filter(|e| e.tested_at.elapsed() < CACHE_TTL)
-            .map(|e| e.ips.clone())
+    async fn cached(&self, host: &str) -> Option<CacheEntry> {
+        self.cache.read().await.get(host).cloned()
+    }
+
+    async fn recent(&self, host: &str, within: Duration) -> bool {
+        self.cached(host)
+            .await
+            .map(|e| e.tested_at.elapsed() < within)
+            .unwrap_or(false)
+    }
+
+    /// 取（或创建）该 host 的探测锁
+    fn gate(&self, host: &str) -> Arc<tokio::sync::Mutex<()>> {
+        self.gates
+            .lock()
+            .unwrap()
+            .entry(host.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
     }
 
     async fn cache_put(&self, host: String, ips: Vec<IpAddr>, candidates: usize) {
@@ -180,17 +243,22 @@ async fn probe_all(name: &ServerName<'static>, ips: &[IpAddr], tls: TlsConnector
         .collect()
 }
 
-/// TCP 建连 + TLS 握手（SNI=目标域名，证书校验与上游客户端一致）
+/// TCP 建连 + TLS 握手（SNI=目标域名，证书校验与上游客户端一致）。
+/// 整个探测（TCP+TLS）受 PROBE_DEADLINE 约束，避免个别不可用 IP 拖慢整批。
 async fn probe_one(ip: IpAddr, name: ServerName<'static>, tls: TlsConnector) -> io::Result<()> {
     let addr = SocketAddr::new(ip, PROBE_PORT);
-    let tcp = tokio::time::timeout(PROBE_TIMEOUT, TcpStream::connect(addr))
-        .await
-        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "TCP 连接超时"))??;
-    let _ = tcp.set_nodelay(true);
-    tokio::time::timeout(PROBE_TIMEOUT, tls.connect(name, tcp))
-        .await
-        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "TLS 握手超时"))??;
-    Ok(())
+    tokio::time::timeout(PROBE_DEADLINE, async move {
+        let tcp = tokio::time::timeout(PROBE_TIMEOUT, TcpStream::connect(addr))
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "TCP 连接超时"))??;
+        let _ = tcp.set_nodelay(true);
+        tokio::time::timeout(PROBE_TIMEOUT, tls.connect(name, tcp))
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "TLS 握手超时"))??;
+        Ok::<(), io::Error>(())
+    })
+    .await
+    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "探测总超时"))?
 }
 
 #[cfg(test)]
@@ -232,7 +300,7 @@ mod tests {
         let tls = TlsConnector::from(Arc::new(rustls::ClientConfig::builder().with_root_certificates(
             rustls::RootCertStore::empty(),
         ).with_no_client_auth()));
-        let t = IpSpeedTester::new(tls);
+        let t = Arc::new(IpSpeedTester::new(tls));
         let ips = t.best_ips("github.com", &[]).await.unwrap();
         assert!(ips.is_empty());
     }

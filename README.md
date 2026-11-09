@@ -1,4 +1,4 @@
-# dev-sidecar-rs
+# github-sidecar
 
 [docmirror/dev-sidecar](https://github.com/docmirror/dev-sidecar)（开发者边车）核心功能的 Rust 重写版。
 **单二进制**，无常驻 Electron，适合日常后台挂着跑：启动即监听 HTTP 代理端口，并自动用系统默认浏览器打开内置 Web 管理界面。
@@ -11,22 +11,22 @@
 | DNS 竞速（优选） | 命中规则的域名同时向多个公共 DNS 发查询，取最快的有效结果，绕开污染/超时 |
 | IP 测速优选 | 规则可配候选 IP 池，自动对池内 IP 做 TCP+TLS 建连测速，选最快的可用 IP 直连（原版 dev-sidecar 的 IP 优选） |
 | IP 直连 | 规则可指定目标 IP 列表，直连但保留原 SNI/主机名（dev-sidecar 的 github 加速思路） |
-| 镜像重定向 | 命中域名+路径的 GET/HEAD 请求 302 到镜像站（ghfast.top、npmmirror 等），需 MITM |
-| MITM 解密 | 按规则解密 HTTPS（首用自动生成根 CA，按域名即时签发叶证书），默认**关闭**，纯加速场景完全不需要装证书 |
+| 镜像重定向 | 命中域名+路径的 GET/HEAD 请求 302 到镜像站（ghproxy.net、npmmirror 等），需 MITM |
+| MITM 解密 | 按规则解密 HTTPS（首用自动生成根 CA，按域名即时签发叶证书），`mitmAll` 默认**关闭**；内置的 GitHub Release 镜像规则默认开启，会解密匹配的下载路径，需先装 CA |
 | Web 管理界面 | actix-web 内置，热更新规则/设置，实时日志，CA 下载，IP 优选结果展示 |
-| 系统代理 | 一键设置/恢复（GNOME gsettings / macOS networksetup / Windows 注册表），程序设置的可随退出自动恢复 |
+| 系统代理 | 一键设置/恢复（GNOME gsettings / macOS networksetup / Windows 注册表）；`autoSystemProxy` 默认开启，退出时恢复为设置前的状态（若原设置就指向本程序则置为 none） |
 | 自动打开浏览器 | 可关（`--no-open` 或设置里关闭） |
 
 ## 快速开始
 
 ```bash
 cargo build --release
-./target/release/dev-sidecar-rs            # 启动并自动打开 http://127.0.0.1:10678
+./target/release/github-sidecar            # 启动并自动打开 http://127.0.0.1:10678
 ```
 
 - 代理地址：`http://127.0.0.1:3128`
 - 管理界面：`http://127.0.0.1:10678`
-- 数据目录：`~/.config/dev-sidecar-rs/`（`ca.crt`、`ca.key.pem`、`config.json`）
+- 数据目录：`~/.config/github-sidecar/`（`ca.crt`、`ca.key.pem`、`config.json`）
 
 终端使用：
 
@@ -49,7 +49,7 @@ git config --global http.https://github.com.proxy http://127.0.0.1:3128
 - **dns_servers**：对这些 DNS 服务器竞速解析
 - **path_prefixes + rewrite_to**：路径命中后 302 重定向。留空表示该域名下的全部路径；
   前缀以 `/` 开头是 starts_with，以 `*` 开头是 contains；
-  `fullUrl` 开启时把完整原始 URL 拼到镜像地址后面（如 `https://ghfast.top/https://github.com/...`）
+  `fullUrl` 开启时把完整原始 URL 拼到镜像地址后面（如 `https://ghproxy.net/https://github.com/...`）
 - **mitm**：解密该域名的 HTTPS 才能看见并改写路径（需要安装 CA；仅 DNS/IP 加速不需要）
 
 解析优先级：`ip_override`（手填）→ `ip_pool`（测速优选）→ `dns_servers`（竞速）→ 系统解析。
@@ -57,7 +57,10 @@ git config --global http.https://github.com.proxy http://127.0.0.1:3128
 只要规则填了 `rewrite_to`，该域名的 HTTPS 就会被解密（不看路径无法改写），并且解密判定取
 **所有命中规则的并集**：把纯 DNS/IP 加速规则排在前面，不会屏蔽掉后面那条需要 MITM 的重定向规则。
 
-内置默认规则：GitHub 全家桶 IP 优选 + DNS 竞速（默认开，开箱即用），GitHub Release 镜像、npm → npmmirror、Google AJAX → 加速镜像（默认关，装 CA 后按需开启）。
+内置默认规则：GitHub 主域（`github.com` / `*.github.com`）IP 优选 + DNS 竞速；`*.githubusercontent.com`、
+`*.githubassets.com`、`*.github.io` 由 Fastly 承载，只用 DNS 竞速（默认开，开箱即用）。
+GitHub Release/Archive 镜像 → `ghproxy.net`（默认开，需装 CA；未装 CA 时这些下载会证书报错）。
+npm → npmmirror、Google AJAX → 加速镜像（默认关，装 CA 后按需开启）。
 
 ## 与原版 (Electron) 的差异
 

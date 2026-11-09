@@ -54,11 +54,13 @@ pub struct Core {
     pub cfg: std::sync::RwLock<Config>,
     pub cfg_path: PathBuf,
     pub dns: DnsResolver,
-    pub speed: IpSpeedTester,
+    pub speed: Arc<IpSpeedTester>,
     pub ca: CaManager,
     pub logs: Arc<LogBuffer>,
     pub started: Instant,
     pub counters: Counters,
+    /// 自动设置系统代理前的用户原设置快照（退出/关闭开关时恢复）
+    pub system_proxy_backup: std::sync::Mutex<Option<crate::systemproxy::ProxyBackup>>,
     client: OnceLock<ProxyClient>,
 }
 
@@ -69,11 +71,12 @@ impl Core {
             cfg: std::sync::RwLock::new(cfg),
             cfg_path,
             dns: DnsResolver::new(),
-            speed: IpSpeedTester::new(tokio_rustls::TlsConnector::from(tls)),
+            speed: Arc::new(IpSpeedTester::new(tokio_rustls::TlsConnector::from(tls))),
             ca,
             logs,
             started: Instant::now(),
             counters: Counters::default(),
+            system_proxy_backup: std::sync::Mutex::new(None),
             client: OnceLock::new(),
         });
         let client = build_upstream_client(core.clone());

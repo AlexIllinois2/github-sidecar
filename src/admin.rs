@@ -201,9 +201,22 @@ async fn system_proxy(core: web::Data<Arc<Core>>, body: web::Json<SystemProxyReq
     let core = admin_core(&core);
     let settings = core.settings();
     let (ok, messages) = if body.enable {
-        crate::systemproxy::set_system_proxy(&settings.listen_host, settings.proxy_port)
+        let (ok, msgs, backup) =
+            crate::systemproxy::set_system_proxy(&settings.listen_host, settings.proxy_port);
+        if ok {
+            *core.system_proxy_backup.lock().unwrap() = backup;
+        }
+        (ok, msgs)
     } else {
-        crate::systemproxy::clear_system_proxy()
+        let backup = core.system_proxy_backup.lock().unwrap().take();
+        match backup {
+            Some(b) => crate::systemproxy::restore_system_proxy(
+                &b,
+                &settings.listen_host,
+                settings.proxy_port,
+            ),
+            None => crate::systemproxy::clear_system_proxy(),
+        }
     };
     HttpResponse::Ok().json(serde_json::json!({ "ok": ok, "messages": messages }))
 }
@@ -213,6 +226,6 @@ async fn download_ca(core: web::Data<Arc<Core>>) -> impl Responder {
     let core = admin_core(&core);
     HttpResponse::Ok()
         .content_type("application/x-pem-file")
-        .insert_header(("content-disposition", "attachment; filename=\"dev-sidecar-rs-ca.crt\""))
+        .insert_header(("content-disposition", "attachment; filename=\"github-sidecar-ca.crt\""))
         .body(core.ca.ca_pem().to_string())
 }

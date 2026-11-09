@@ -136,7 +136,7 @@ fn generate_ca() -> Result<(String, String)> {
         .push(DnType::CommonName, "Dev Sidecar Rs Root CA");
     params
         .distinguished_name
-        .push(DnType::OrganizationName, "dev-sidecar-rs");
+        .push(DnType::OrganizationName, "github-sidecar");
     params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
     params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
     params.use_authority_key_identifier_extension = true;

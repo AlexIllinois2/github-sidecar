@@ -38,7 +38,7 @@ impl Default for Settings {
             proxy_port: PROXY_PORT_DEFAULT,
             admin_port: ADMIN_PORT_DEFAULT,
             open_browser: true,
-            auto_system_proxy: false,
+            auto_system_proxy: true,
             mitm_all: false,
             insecure_tls: false,
             default_dns_servers: vec![
@@ -147,6 +147,7 @@ impl Config {
         match fs::read_to_string(path) {
             Ok(s) => match serde_json::from_str::<Config>(&s) {
                 Ok(mut c) => {
+                    c.migrate_builtin_rules();
                     c.migrate_builtin_pools();
                     Ok(c)
                 }
@@ -168,6 +169,42 @@ impl Config {
                 if let Some(d) = default_rules().into_iter().find(|d| d.id == r.id) {
                     r.ip_pool = d.ip_pool;
                 }
+            }
+        }
+    }
+
+    /// 存量配置迁移：旧版内置 github 规则把 github.com 的 IP 池套到
+    /// *.githubusercontent.com / *.githubassets.com / *.github.io（Fastly 承载），
+    /// 探测必然全失败并拖慢首个请求。这里把该规则收敛到 GitHub 边缘域名，
+    /// 并补一条纯 DNS 竞速的 CDN 规则。只在 hosts 与旧默认值完全一致时迁移，
+    /// 用户自己改过域名列表就不动。
+    fn migrate_builtin_rules(&mut self) {
+        const LEGACY_GITHUB_HOSTS: &[&str] = &[
+            "github.com",
+            "*.github.com",
+            "*.githubusercontent.com",
+            "*.githubassets.com",
+            "*.github.io",
+        ];
+        let narrow: &[&str] = &["github.com", "*.github.com"];
+        let mut needs_cdn = false;
+        for r in &mut self.rules {
+            let is_legacy = r.id == "builtin-github"
+                && r.hosts.len() == LEGACY_GITHUB_HOSTS.len()
+                && LEGACY_GITHUB_HOSTS
+                    .iter()
+                    .all(|h| r.hosts.iter().any(|x| x == h));
+            if is_legacy {
+                r.hosts = narrow.iter().map(|s| s.to_string()).collect();
+                needs_cdn = true;
+            }
+        }
+        if needs_cdn && !self.rules.iter().any(|r| r.id == "builtin-github-cdn") {
+            if let Some(cdn) = default_rules()
+                .into_iter()
+                .find(|r| r.id == "builtin-github-cdn")
+            {
+                self.rules.push(cdn);
             }
         }
     }
@@ -224,7 +261,7 @@ pub fn default_rules() -> Vec<Rule> {
             "builtin-github",
             "GitHub 加速（IP 优选 + DNS 竞速，无需证书）",
             true,
-            &["github.com", "*.github.com", "*.githubusercontent.com", "*.githubassets.com", "*.github.io"],
+            &["github.com", "*.github.com"],
             &[],
             &[],
             GITHUB_IP_POOL,
@@ -233,16 +270,31 @@ pub fn default_rules() -> Vec<Rule> {
             false,
             false,
         ),
+        // 这些域名由 Fastly 承载（185.199.x），和 github.com 的 GFE/Azure 边缘 IP 不是一套：
+        // 套用 GitHub 的 IP 池会 100% 探测失败，白白拖慢首个请求，所以只做 DNS 竞速。
+        rule(
+            "builtin-github-cdn",
+            "GitHub 静态资源/raw（DNS 竞速）",
+            true,
+            &["*.githubusercontent.com", "*.githubassets.com", "*.github.io"],
+            &[],
+            &[],
+            &[],
+            &dns_refs,
+            "",
+            false,
+            false,
+        ),
         rule(
             "builtin-github-release",
             "GitHub Release/Archive 镜像重定向（需装 CA）",
-            false,
+            true,
             &["github.com", "codeload.github.com"],
             &["*releases/download/", "*archive/refs/tags/", "*archive/*.zip", "*archive/*.tar.gz"],
             &[],
             &[],
             &[],
-            "https://ghfast.top",
+            "https://ghproxy.net",
             true,
             true,
         ),

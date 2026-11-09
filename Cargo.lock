@@ -606,37 +606,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "dev-sidecar-rs"
-version = "0.1.0"
-dependencies = [
- "actix-web",
- "anyhow",
- "bytes",
- "clap",
- "dirs",
- "futures-util",
- "http-body-util",
- "hyper",
- "hyper-rustls",
- "hyper-util",
- "open",
- "rcgen",
- "rustls",
- "rustls-native-certs",
- "rustls-pki-types",
- "serde",
- "serde_json",
- "sha2",
- "time",
- "tokio",
- "tokio-rustls",
- "tower-service",
- "tracing",
- "tracing-subscriber",
- "winreg",
-]
-
-[[package]]
 name = "digest"
 version = "0.10.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -839,6 +808,37 @@ dependencies = [
  "libc",
  "r-efi",
  "rand_core",
+]
+
+[[package]]
+name = "github-sidecar"
+version = "0.1.0"
+dependencies = [
+ "actix-web",
+ "anyhow",
+ "bytes",
+ "clap",
+ "dirs",
+ "futures-util",
+ "http-body-util",
+ "hyper",
+ "hyper-rustls",
+ "hyper-util",
+ "open",
+ "rcgen",
+ "rustls",
+ "rustls-native-certs",
+ "rustls-pki-types",
+ "serde",
+ "serde_json",
+ "sha2",
+ "time",
+ "tokio",
+ "tokio-rustls",
+ "tower-service",
+ "tracing",
+ "tracing-subscriber",
+ "winreg",
 ]
 
 [[package]]

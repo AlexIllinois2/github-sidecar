@@ -1,4 +1,4 @@
-//! dev-sidecar-rs：用 Rust 重写的 dev-sidecar（开发者边车）。
+//! github-sidecar：用 Rust 重写的 dev-sidecar（开发者边车）。
 //! 单二进制：HTTP 代理（DNS 竞速 / IP 直连 / 可选 MITM 重定向）+ 内置 Web 管理界面。
 
 mod admin;
@@ -20,12 +20,12 @@ use std::time::Duration;
 
 /// 开发者边车（Rust 版）：单二进制后台加速代理
 #[derive(Parser, Debug)]
-#[command(name = "dev-sidecar-rs", version, about)]
+#[command(name = "github-sidecar", version, about)]
 struct Args {
     /// 配置文件路径（默认 <数据目录>/config.json）
     #[arg(long)]
     config: Option<PathBuf>,
-    /// 数据目录（存 CA 证书和配置，默认 ~/.config/dev-sidecar-rs）
+    /// 数据目录（存 CA 证书和配置，默认 ~/.config/github-sidecar）
     #[arg(long)]
     data_dir: Option<PathBuf>,
     /// 覆盖代理端口
@@ -48,7 +48,7 @@ fn main() -> Result<()> {
     let data_dir = args.data_dir.clone().unwrap_or_else(|| {
         dirs::config_dir()
             .unwrap_or_else(|| PathBuf::from("."))
-            .join("dev-sidecar-rs")
+            .join("github-sidecar")
     });
     let cfg_path = args.config.clone().unwrap_or_else(|| data_dir.join("config.json"));
 
@@ -161,7 +161,7 @@ fn main() -> Result<()> {
         }
 
         println!("──────────────────────────────────────────────");
-        println!("  dev-sidecar-rs v{}", env!("CARGO_PKG_VERSION"));
+        println!("  github-sidecar v{}", env!("CARGO_PKG_VERSION"));
         println!("  管理界面  {admin_url}");
         println!("  代理地址  {proxy_addr}");
         println!("  数据目录  {}", data_dir.display());
@@ -173,12 +173,15 @@ fn main() -> Result<()> {
         // 自动设置系统代理
         let mut proxy_was_set = false;
         if run_settings.auto_system_proxy && !no_system_proxy {
-            let (ok, msgs) =
+            let (ok, msgs, backup) =
                 systemproxy::set_system_proxy(&run_settings.listen_host, run_settings.proxy_port);
             for m in &msgs {
                 tracing::info!("{m}");
             }
-            proxy_was_set = ok;
+            if ok {
+                proxy_was_set = true;
+                *run_core.system_proxy_backup.lock().unwrap() = backup;
+            }
         }
 
         // 自动打开浏览器
@@ -206,7 +209,16 @@ fn main() -> Result<()> {
 
         tracing::info!("收到退出信号，正在清理…");
         if proxy_was_set {
-            let (_, msgs) = systemproxy::clear_system_proxy();
+            let backup = run_core.system_proxy_backup.lock().unwrap().take();
+            let msgs = match backup {
+                Some(b) => systemproxy::restore_system_proxy(
+                    &b,
+                    &run_settings.listen_host,
+                    run_settings.proxy_port,
+                )
+                .1,
+                None => systemproxy::clear_system_proxy().1,
+            };
             for m in &msgs {
                 tracing::info!("{m}");
             }

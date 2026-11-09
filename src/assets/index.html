@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>dev-sidecar-rs · 开发者边车</title>
+<title>github-sidecar · 开发者边车</title>
 <style>
   :root {
     --bg: #0f1420; --panel: #171e2e; --panel2: #1d2740; --line: #2a3653;
@@ -110,7 +110,7 @@
 <body>
 <header>
   <span class="dot" id="healthDot"></span>
-  <h1>dev-sidecar-rs</h1><span class="ver" id="verText"></span>
+  <h1>github-sidecar</h1><span class="ver" id="verText"></span>
   <nav>
     <button data-tab="status" class="active">状态</button>
     <button data-tab="rules">加速规则</button>
@@ -231,9 +231,9 @@
       <h2>安装方法</h2>
       <ol class="install hint">
         <li><b>Linux (Fedora/RHEL)</b>：
-          <code>sudo cp ca.crt /etc/pki/ca-trust/source/anchors/dev-sidecar-rs-ca.crt && sudo update-ca-trust</code></li>
+          <code>sudo cp github-sidecar-ca.crt /etc/pki/ca-trust/source/anchors/github-sidecar-ca.crt && sudo update-ca-trust</code></li>
         <li><b>Linux (Debian/Ubuntu)</b>：
-          <code>sudo cp ca.crt /usr/local/share/ca-certificates/dev-sidecar-rs-ca.crt && sudo update-ca-certificates</code></li>
+          <code>sudo cp github-sidecar-ca.crt /usr/local/share/ca-certificates/github-sidecar-ca.crt && sudo update-ca-certificates</code></li>
         <li><b>Windows</b>：双击 ca.crt → 安装证书 → 本地计算机 → “将所有的证书都放入下列存储” → 受信任的根证书颁发机构。</li>
         <li><b>macOS</b>：双击 ca.crt 导入“系统”钥匙串，然后设置为“始终信任”。</li>
         <li><b>Firefox</b>：设置 → 隐私与安全 → 证书 → 查看证书 → 导入 ca.crt（Firefox 用自己的证书库）。</li>
@@ -312,7 +312,7 @@ async function refreshStatus() {
     $('#stUptime').textContent = fmtUptime(s.uptimeSec);
     $('#stDataDir').textContent = s.dataDir;
     $('#certFp').textContent = s.caSha256;
-    document.title = `(${s.counters.total}) dev-sidecar-rs`;
+    document.title = `(${s.counters.total}) github-sidecar`;
     $('#cmdProxy1').textContent = `export https_proxy=http://${s.proxyAddr} http_proxy=http://${s.proxyAddr}`;
     $('#cmdProxy2').textContent = `git config --global http.https://github.com.proxy http://${s.proxyAddr}`;
   } catch (e) {

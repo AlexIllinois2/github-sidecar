@@ -17,7 +17,10 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+/// 单个候选 IP 的建连超时。候选是逐个尝试的，取值过大时 12 个不可达 IP
+/// 会串行累计到 30s+（正好是"打开很慢"的来源之一）；国内到 GitHub 的 RTT
+/// 通常 200~400ms，1.5s 足够区分"可连"与"被丢包"。
+const CONNECT_TIMEOUT: Duration = Duration::from_millis(1500);
 
 pub async fn run(core: Arc<Core>) -> anyhow::Result<()> {
     let settings = core.settings();
@@ -345,7 +348,7 @@ pub fn empty_body() -> BoxBody {
 }
 
 pub fn err_resp<S: AsRef<str>>(status: StatusCode, msg: S) -> Response<BoxBody> {
-    let body = format!("dev-sidecar-rs: {}\n", msg.as_ref());
+    let body = format!("github-sidecar: {}\n", msg.as_ref());
     Response::builder()
         .status(status)
         .header("content-type", "text/plain; charset=utf-8")

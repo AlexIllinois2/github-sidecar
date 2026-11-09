@@ -1,12 +1,12 @@
 [package]
-name = "dev-sidecar-rs"
+name = "github-sidecar"
 version = "0.1.0"
 edition = "2021"
 description = "Dev-sidecar rewritten in Rust: MITM-capable HTTP(S) proxy with DNS racing, github acceleration rules and a built-in web admin UI. Single static binary."
 license = "MPL-2.0"
 
 [[bin]]
-name = "dev-sidecar-rs"
+name = "github-sidecar"
 path = "src/main.rs"
 
 [dependencies]
